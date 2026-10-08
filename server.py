@@ -192,15 +192,19 @@ def bot_turns_since(since_ms):
         kind = m.get("kind")
         at = int(m.get("at", 0) or 0)
         t = turns.setdefault(tid, {"first": "", "first_at": 0,
-                                   "last": "", "last_at": 0, "ended": False})
+                                   "last": "", "last_at": 0, "ended": False,
+                                   "final": ""})
         if kind == "digest":
             t["ended"] = True
-        elif kind == "text" and at > since_ms:
+        elif kind == "text":
             body = (m.get("text") or "").strip()
             if body:
-                if not t["first"]:
+                if at > since_ms and not t["first"]:
                     t["first"], t["first_at"] = body, at
-                t["last"], t["last_at"] = body, at
+                if at > since_ms:
+                    t["last"], t["last_at"] = body, at
+                if m.get("turnTerminal"):
+                    t["final"] = body
     return {k: v for k, v in turns.items() if v["last"]}
 
 MIRROR_GRACE   = 150   # s de silencio total tras el ultimo texto antes de cerrar el espejo
@@ -237,8 +241,7 @@ def _mirror_follow(t0):
             if not turns:
                 continue
             for t in sorted(turns.values(), key=lambda x: x["last_at"]):
-                for txt in (t["first"], t["last"]):
-                    _publish("bot", txt)
+                _publish("bot", t.get("final") or "")
             now = now_ms()
             idle = (now - max((t["last_at"] for t in turns.values()), default=now)) / 1000.0
             if idle < 0:
@@ -329,7 +332,7 @@ def _dispatch_locked(text, uid=None):
         # 2) respuesta final: al cerrarse el turno (llega su digest)
         ready = [t for t in ordered if t["ended"]]
         if ready:
-            final = "\n\n".join(t["last"] for t in ready)
+            final = "\n\n".join((t.get("final") or t["last"]) for t in ready)
             if final.strip() and final.strip() != acked.strip():
                 if not already_sent("bot", final):
                     add_msg("bot", final)
@@ -339,7 +342,7 @@ def _dispatch_locked(text, uid=None):
             return
 
         # 3) respaldo: hay texto pero el turno no cierra; si esta quieto 45 s, publicar
-        cand = "\n\n".join(t["last"] for t in ordered)
+        cand = "\n\n".join((t.get("final") or t["last"]) for t in ordered)
         if cand == last_seen:
             stable += 1
         else:
