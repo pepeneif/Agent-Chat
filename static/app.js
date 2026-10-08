@@ -62,6 +62,10 @@ function fmtTime(ms) {
 }
 function linkify(text) {
   let h = esc(text);
+  // Markdown minimo: **negritas**, `codigo`, *cursiva*. Se aplica sobre texto YA escapado.
+  h = h.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  h = h.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  h = h.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
   h = h.replace(/(\/api\/file\/[0-9a-f]{32})/g, (m) => `<a class="file" href="${m}" target="_blank" rel="noopener">abrir adjunto</a>`);
   return h;
 }
