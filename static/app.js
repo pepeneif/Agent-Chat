@@ -1,6 +1,6 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
-const state = { pending: [], lastAt: 0, timer: null, sending: false };
+const state = { pending: [], lastAt: 0, timer: null, sending: false, awaitOwn: false };
 
 async function api(path, opts) {
   const r = await fetch(path, Object.assign({ credentials: "same-origin" }, opts || {}));
@@ -104,6 +104,18 @@ function scrollToTopOf(el, offset) {
   s.scrollTop = target;
   s.style.scrollBehavior = prev || "";
 }
+function scrollBottomOf(el, offset) {
+  const s = $("scroll");
+  if (!s || !el) return;
+  const box = el.getBoundingClientRect();
+  const sbox = s.getBoundingClientRect();
+  const bottom = box.bottom - sbox.top + s.scrollTop;
+  const target = bottom - s.clientHeight + (offset == null ? 10 : offset);
+  const prev = s.style.scrollBehavior;
+  s.style.scrollBehavior = "auto";
+  s.scrollTop = Math.max(0, target);
+  s.style.scrollBehavior = prev || "";
+}
 function append(m) {
   const el = render(m);
   el.dataset.at = String(m.at || 0);
@@ -133,7 +145,13 @@ async function tick() {
     if (m.at > state.lastAt) state.lastAt = m.at;
     return el;
   });
-  if (msgs.length && stick) scrollToTopOf(els[0]);   // ver el principio del mensaje nuevo
+  if (state.awaitOwn) {
+    const mine = msgs.findIndex((m) => m.role === "user");
+    if (mine >= 0) { scrollBottomOf(els[mine]); state.awaitOwn = false; }
+    else if (msgs.length && stick) scrollToTopOf(els[0]);
+  } else if (msgs.length && stick) {
+    scrollToTopOf(els[0]);   // ver el principio del mensaje nuevo
+  }
   if (hadBot) { state.sending = false; $("btnSend").disabled = false; }
 }
 function startPolling() { stopPolling(); state.timer = setInterval(tick, 1000); tick(); }
@@ -191,9 +209,9 @@ async function send() {
   if (!r.ok) { state.sending = false; $("btnSend").disabled = false; alert("No se pudo enviar."); return; }
   $("text").value = ""; autosize();
   state.pending = []; $("attachrow").innerHTML = "";
-  scrollDown(true);
+  state.awaitOwn = true;       // al llegar, mi mensaje queda pegado abajo
   setTyping(true);
-  setTimeout(tick, 600);
+  setTimeout(tick, 300);
 }
 
 /* ---------------- push (avisos) ---------------- */
