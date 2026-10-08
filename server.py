@@ -416,6 +416,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._require():
                     return
                 return self._push_subscribe()
+            if p == "/api/push/unsubscribe":
+                if not self._require():
+                    return
+                return self._push_unsubscribe()
             if p == "/api/push/test":
                 if not self._require():
                     return
@@ -547,6 +551,15 @@ class Handler(BaseHTTPRequestHandler):
         with _dblock, db() as c:
             c.execute("INSERT OR REPLACE INTO push_subs(endpoint,sub,created) VALUES(?,?,?)",
                       (sub["endpoint"], blob, now_ms()))
+        return self._json(200, {"ok": True})
+
+    def _push_unsubscribe(self):
+        body = json.loads(self._body().decode("utf-8") or "{}")
+        endpoint = body.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            return self._json(400, {"error": "bad endpoint"})
+        with _dblock, db() as c:
+            c.execute("DELETE FROM push_subs WHERE endpoint=?", (endpoint,))
         return self._json(200, {"ok": True})
 
     def _file(self, fid):

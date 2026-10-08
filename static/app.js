@@ -243,6 +243,23 @@ function b64ToU8(b64) {
   const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
   return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
 }
+async function disablePush(btn) {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      await api("/api/push/unsubscribe", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint: sub.endpoint }),
+      });
+      try { await sub.unsubscribe(); } catch (e) {}
+    }
+    setNotifyBtn(btn, "off");
+    showBanner(false);
+  } catch (e) {
+    alert("Error desactivando avisos: " + e.message);
+  }
+}
 async function enablePush(btn) {
   try {
     if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
@@ -266,7 +283,7 @@ async function enablePush(btn) {
       body: JSON.stringify({ subscription: sub.toJSON() }),
     });
     if (r.ok) {
-      if (btn) { btn.textContent = "Avisos ON"; btn.classList.add("on"); }
+      setNotifyBtn(btn, "on");
       showBanner(false);
       api("/api/push/test", { method: "POST" });
     }
@@ -274,6 +291,16 @@ async function enablePush(btn) {
   } catch (e) {
     alert("Error activando avisos: " + e.message);
   }
+}
+function setNotifyBtn(btn, state) {
+  if (!btn) return;
+  btn.classList.remove("on", "off");
+  if (state === "on") { btn.textContent = "Avisos ON"; btn.classList.add("on"); }
+  else if (state === "off") { btn.textContent = "Avisos OFF"; btn.classList.add("off"); }
+  else if (state === "blocked") btn.textContent = "Avisos bloqueado";
+  else if (state === "unsupported") btn.textContent = "Avisos n/d";
+  else if (state === "error") btn.textContent = "Avisos error";
+  else btn.textContent = "Avisos";
 }
 function showBanner(on, txt) {
   const b = $("pushBanner");
@@ -284,25 +311,26 @@ function showBanner(on, txt) {
 async function pushState(btn) {
   try {
     if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
-      btn.textContent = "Avisos n/d";
+      setNotifyBtn(btn, "unsupported");
       showBanner(true, "Este iPhone no expone avisos aqui. Abre el chat desde el icono de la pantalla de inicio.");
       return;
     }
     if (Notification.permission === "denied") {
-      btn.textContent = "Avisos bloqueado";
+      setNotifyBtn(btn, "blocked");
       showBanner(true, "Avisos bloqueados. Ve a Ajustes > Notificaciones > Chat y activalos.");
-      return;
-    }
-    if (Notification.permission !== "granted") {
-      btn.textContent = "Avisos";
-      showBanner(true, "Activa los avisos para que te suene el movil cuando te escriba.");
       return;
     }
     const reg = await navigator.serviceWorker.ready;
     const sub = await reg.pushManager.getSubscription();
-    if (sub) { btn.textContent = "Avisos ON"; btn.classList.add("on"); showBanner(false); }
-    else { btn.textContent = "Avisos"; showBanner(true, "Falta un ultimo toque: activa los avisos."); }
-  } catch (e) { btn.textContent = "Avisos error"; showBanner(true, "Error activando avisos: " + e.message); }
+    if (sub) { setNotifyBtn(btn, "on"); showBanner(false); return; }
+    if (Notification.permission === "granted") {
+      setNotifyBtn(btn, "off");
+      showBanner(true, "Avisos desactivados. Toca Avisos OFF para volver a activarlos.");
+      return;
+    }
+    setNotifyBtn(btn, "plain");
+    showBanner(true, "Activa los avisos para que te suene el movil cuando te escriba.");
+  } catch (e) { setNotifyBtn(btn, "error"); showBanner(true, "Error consultando avisos: " + e.message); }
 }
 
 /* ---------------- wire ---------------- */
@@ -335,7 +363,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   $("btnSend").onclick = send;
-  $("btnNotify").onclick = () => enablePush($("btnNotify"));
+  const onNotify = async () => {
+    const btn = $("btnNotify");
+    const reg = await navigator.serviceWorker.ready.catch(() => null);
+    const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
+    if (sub) await disablePush(btn); else await enablePush(btn);
+  };
+  $("btnNotify").onclick = onNotify;
   $("btnPushGo").onclick = () => enablePush($("btnNotify"));
 
   const me = await api("/api/me");

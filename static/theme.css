@@ -21,6 +21,7 @@
   --color-bubble-user-ink:#1a1a18;
   --color-success:#3f6b47;
   --color-danger:#a33a32;
+  --color-off:#8b4032;
   --color-scrollbar:#c9c0ae;
   --color-maus-line:#6b6559;
   --font-sans:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
@@ -50,7 +51,8 @@ header.top button.ghost{
   background:transparent;border:1px solid var(--color-hairline);color:var(--color-ink-secondary);
   border-radius:var(--radius-lg);padding:6px 10px;font:inherit;font-size:13px;cursor:pointer}
 header.top button.ghost:hover{background:var(--color-raised-hover)}
-header.top button.ghost.on{background:var(--color-success);border-color:var(--color-success);color:#fff}
+header.top button.ghost.on{color:var(--color-success);font-weight:600}
+header.top button.ghost.off{color:var(--color-off);font-weight:600}
 
 main#scroll{flex:1;overflow-y:auto;padding:12px 10px;scroll-behavior:smooth}
 .msg{display:flex;margin:10px 0;gap:8px}
