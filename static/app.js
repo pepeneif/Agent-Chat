@@ -173,7 +173,7 @@ async function tick() {
     if (mine >= 0) { scrollBottomOf(els[mine]); state.awaitOwn = false; }
     else if (msgs.length && stick) scrollToTopOf(els[0]);
   } else if (msgs.length && stick) {
-    revealMessage(els[0]);   // entero si cabe; si no, su principio
+    revealMessage(els[els.length - 1]);   // anclar el mensaje MAS NUEVO, no el primero del lote
   }
   if (hadBot) { state.sending = false; $("btnSend").disabled = false; }
 }
@@ -342,7 +342,17 @@ async function pushState(btn) {
     }
     const reg = await navigator.serviceWorker.ready;
     const sub = await reg.pushManager.getSubscription();
-    if (sub) { setNotifyBtn(btn, "on"); showBanner(false); return; }
+    if (sub) {
+      const st = await api("/api/push/status", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint: sub.endpoint }),
+      });
+      if (st.ok && st.data && st.data.registered) { setNotifyBtn(btn, "on"); showBanner(false); return; }
+      try { await sub.unsubscribe(); } catch (e) {}
+      setNotifyBtn(btn, "off");
+      showBanner(true, "Avisos desactivados. Toca Avisos OFF para volver a activarlos.");
+      return;
+    }
     if (Notification.permission === "granted") {
       setNotifyBtn(btn, "off");
       showBanner(true, "Avisos desactivados. Toca Avisos OFF para volver a activarlos.");
@@ -399,6 +409,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.addEventListener("message", (e) => {
+      if (e.data && e.data.type === "new-message") tick();
+    });
     navigator.serviceWorker.register("/sw.js").then((reg) => { pushState($("btnNotify")); startHeartbeat(reg); }).catch(() => {});
   }
 });
