@@ -9,6 +9,16 @@ async function api(path, opts) {
   return { ok: r.ok, status: r.status, data: j };
 }
 
+let _toastT = null;
+function toast(msg, ms) {
+  const el = $("toast");
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.remove("hidden");
+  if (_toastT) clearTimeout(_toastT);
+  _toastT = setTimeout(() => el.classList.add("hidden"), ms || 4000);
+}
+
 /* ---------------- login ---------------- */
 function showLogin() {
   $("loginView").classList.remove("hidden");
@@ -420,6 +430,28 @@ async function pushState(btn) {
   } catch (e) { setNotifyBtn(btn, "error"); showBanner(true, "Error consultando avisos: " + e.message); }
 }
 
+/* ---------------- depurar ---------------- */
+async function debugChat() {
+  const ok = confirm("Depurar: se reducira el historial de este chat al minimo y se compactara mi contexto para que vuelva a responder rapido.\n\n¿Seguir?");
+  if (!ok) return;
+  const r = await api("/api/debug", { method: "POST" });
+  if (!r.ok) { toast("No se pudo depurar."); return; }
+  if (r.data && r.data.started === false) { toast("Ya hay una depuracion en curso."); }
+  else toast("Depurando... compacto mi contexto y luego recargo.");
+  let n = 0, seen = false;
+  const iv = setInterval(async () => {
+    n++;
+    const h = await api("/api/history?limit=1");
+    const busy = h.data && h.data.busy;
+    if (busy) seen = true;
+    if ((seen && !busy) || n > 220) {
+      clearInterval(iv);
+      await loadHistory(); scrollDown(true);
+      toast("Listo. Historial depurado y contexto compactado.");
+    }
+  }, 3000);
+}
+
 /* ---------------- wire ---------------- */
 window.addEventListener("DOMContentLoaded", async () => {
   $("btnToken").onclick = requestToken;
@@ -427,7 +459,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("btnVerify").onclick = verify;
   $("tok").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); verify(); } });
   $("btnLogout").onclick = logout;
-  $("btnReload").onclick = () => loadHistory().then(scrollDown);
+  $("btnDebug").onclick = debugChat;
   $("btnAttach").onclick = () => $("file").click();
   $("file").addEventListener("change", async (e) => {
     for (const f of Array.from(e.target.files || [])) await upload(f);

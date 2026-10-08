@@ -66,6 +66,7 @@ _dblock = threading.Lock()
 _dispatch_lock = threading.Lock()   # serializa los turnos: un dispatch a la vez
 _busy = {"on": False, "since": 0, "q": 0}   # hay un turno en curso (para avisar al cliente)
 _mirror = {"on": False}   # hay un hilo "espejo" siguiendo el hilo del agente
+_debuging = {"on": False}   # hay una depuracion en curso
 
 # ---------- db ----------
 def db():
@@ -170,6 +171,80 @@ def omb_post(path, payload):
                   headers={"content-type": "application/json"}, method="POST")
     with urlopen(req, timeout=60) as r:
         return json.loads(r.read().decode("utf-8") or "{}")
+
+DEBUG_KEEP = int(os.environ.get("CHAT_DEBUG_KEEP", "40"))
+
+def _debug_busy(on):
+    """Marca/desmarca el flag de trabajo (para que el chat muestre 'Manager esta trabajando')."""
+    if on:
+        _busy["q"] += 1
+        _busy["on"] = True
+        if not _busy["since"]:
+            _busy["since"] = now_ms()
+    else:
+        _busy["q"] = max(0, _busy["q"] - 1)
+        if _busy["q"] == 0:
+            _busy["on"] = False
+            _busy["since"] = 0
+
+def _omb_busy():
+    """True/False si el bot esta ocupado; None si no se pudo saber."""
+    try:
+        d = omb_get("/api/bots")
+        for x in d.get("bots", []):
+            if x.get("id") == BOT_ID:
+                return bool(x.get("busy"))
+    except Exception:
+        pass
+    return None
+
+def purge_history(keep):
+    """Reduce el historial del chat a los ultimos `keep` mensajes (mas recientes) y
+    deja una nota de sistema. Devuelve cuantos borro."""
+    keep = max(1, int(keep))
+    with _dblock, db() as c:
+        rows = c.execute("SELECT id FROM messages ORDER BY at").fetchall()
+        total = len(rows)
+        victims = [r["id"] for r in rows[:max(0, total - keep)]]
+        if victims:
+            c.executemany("DELETE FROM messages WHERE id=?", [(v,) for v in victims])
+        note = ("Depurado: historial reducido a los ultimos %d mensajes y contexto compactado."
+                % min(keep, total))
+        c.execute("INSERT INTO messages(id,role,content,at,uid) VALUES(?,?,?,?,?)",
+                  (uuid.uuid4().hex, "system", note, now_ms(), None))
+    return len(victims)
+
+def debug_worker(keep=None):
+    """Dispara la compactacion NATIVA del hilo del agente en OpenMausBot y poda el historial
+    del chat. Nunca toca el hilo con un turno en curso."""
+    keep = DEBUG_KEEP if keep is None else keep
+    _debug_busy(True)
+    try:
+        deadline = time.time() + 900
+        while time.time() < deadline:          # esperar a que el bot este ocioso
+            b = _omb_busy()
+            if b is False:
+                break
+            time.sleep(4)
+        try:
+            omb_post(f"/api/bots/{BOT_ID}/compact", {"threadId": THREAD_ID})
+            log_line("debug: compact disparado")
+        except Exception as e:
+            log_line(f"debug: compact fallo: {e}")
+        time.sleep(6)                          # deja que arranque el turno de resumen
+        t1 = time.time()
+        while time.time() - t1 < 420:
+            b = _omb_busy()
+            if b is False:
+                break
+            time.sleep(5)
+        n = purge_history(keep)
+        log_line(f"debug: purged={n} keep={keep}")
+    except Exception as e:
+        log_line(f"debug: error {e}")
+    finally:
+        _debug_busy(False)
+        _debuging["on"] = False
 
 def bot_turns_since(since_ms):
     """Turnos del bot posteriores a since_ms.
@@ -491,6 +566,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._require():
                     return
                 return self._send()
+            if p == "/api/debug":
+                if not self._require():
+                    return
+                return self._debug()
             return self._json(404, {"error": "not found"})
         except Exception as e:
             traceback.print_exc()
@@ -584,6 +663,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     # ---- chat ----
+    def _debug(self):
+        if _debuging["on"]:
+            return self._json(200, {"ok": True, "started": False, "reason": "running"})
+        _debuging["on"] = True
+        threading.Thread(target=debug_worker, daemon=True).start()
+        return self._json(200, {"ok": True, "started": True})
+
     def _send(self):
         body = json.loads(self._body().decode("utf-8") or "{}")
         text = (body.get("text") or "").strip()

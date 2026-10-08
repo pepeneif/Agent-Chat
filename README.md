@@ -22,6 +22,9 @@ para el chat en sí; solo `pywebpush` para las notificaciones.
 - **Sesión de 30 días** en una cookie `HttpOnly`, `Secure`, `SameSite=Lax`.
 - **PWA instalable** en iOS/Android (Safari → *Añadir a pantalla de inicio*).
 - **Notificaciones push** (sonido, app cerrada) mediante VAPID + service worker.
+- **Botón "Depurar"**: compacta el contexto del hilo con la compactación nativa de OpenMausBot
+  y reduce el historial del chat al mínimo, para que el agente vuelva a responder rápido.
+  Respeta los turnos en curso (nunca depura en vivo).
 - **Acuse rápido + respuesta final**: en cuanto el agente empieza a responder se publica
   un primer mensaje corto, y al terminar llega la respuesta completa. Nunca te deja colgado.
 - **Indicador "está trabajando… (Ns)"** durante todo el turno, con los segundos que lleva.
