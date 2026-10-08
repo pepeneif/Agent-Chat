@@ -15,6 +15,9 @@ para el chat en sí; solo `pywebpush` para las notificaciones.
 ## Qué hace
 
 - **Chat de texto** con burbujas, historial propio y adjuntos (imágenes y ficheros, hasta 25 MB).
+- **Formato ligero en los mensajes**: `**negritas**`, `` `código` ``, *cursiva*, listas
+  (con guion o numeradas), citas, títulos y separadores. Se renderiza sobre el texto ya
+  escapado, así que el contenido nunca puede inyectar HTML.
 - **Autenticación por código de un solo uso** enviado por email (sin contraseñas).
 - **Sesión de 30 días** en una cookie `HttpOnly`, `Secure`, `SameSite=Lax`.
 - **PWA instalable** en iOS/Android (Safari → *Añadir a pantalla de inicio*).

@@ -60,14 +60,65 @@ function fmtTime(ms) {
   const d = new Date(ms);
   return d.toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
-function linkify(text) {
-  let h = esc(text);
-  // Markdown minimo: **negritas**, `codigo`, *cursiva*. Se aplica sobre texto YA escapado.
+function mdInline(s) {
+  let h = esc(s);
   h = h.replace(/`([^`\n]+)`/g, "<code>$1</code>");
   h = h.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
-  h = h.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
-  h = h.replace(/(\/api\/file\/[0-9a-f]{32})/g, (m) => `<a class="file" href="${m}" target="_blank" rel="noopener">abrir adjunto</a>`);
+  h = h.replace(/(^|\W)\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
   return h;
+}
+function linkify(text) {
+  const src = (text || "").replace(/\r\n?/g, "\n");
+  const lines = src.split("\n");
+  const out = [];
+  const liRe = /^\s*[-\u2022]\s+(.*)$/;
+  const olRe = /^\s*\d+[.)]\s+(.*)$/;
+  const flushList = (tag, items) =>
+    out.push("<" + tag + ">" + items.map((x) => "<li>" + mdInline(x) + "</li>").join("") + "</" + tag + ">");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { i++; continue; }
+    const hm = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (hm) { const lv = Math.min(hm[1].length, 3); out.push("<h" + lv + ">" + mdInline(hm[2]) + "</h" + lv + ">"); i++; continue; }
+    if (/^\s*(---+|\*\*\*+)\s*$/.test(line)) { out.push("<hr>"); i++; continue; }
+    if (/^\s*>\s?/.test(line)) {
+      const q = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
+      out.push("<blockquote>" + mdInline(q.join("\n")).replace(/\n/g, "<br>") + "</blockquote>");
+      continue;
+    }
+    if (liRe.test(line)) {
+      const buf = [];
+      while (i < lines.length) {
+        const m = liRe.exec(lines[i]);
+        if (m) { buf.push(m[1]); i++; }
+        else if (/^\s+\S/.test(lines[i]) && buf.length) { buf[buf.length - 1] += " " + lines[i].trim(); i++; }
+        else break;
+      }
+      flushList("ul", buf); continue;
+    }
+    if (olRe.test(line)) {
+      const buf = [];
+      while (i < lines.length) {
+        const m = olRe.exec(lines[i]);
+        if (m) { buf.push(m[1]); i++; }
+        else if (/^\s+\S/.test(lines[i]) && buf.length) { buf[buf.length - 1] += " " + lines[i].trim(); i++; }
+        else break;
+      }
+      flushList("ol", buf); continue;
+    }
+    const para = [line];
+    i++;
+    while (i < lines.length && !/^\s*$/.test(lines[i]) && !liRe.test(lines[i]) && !olRe.test(lines[i])
+           && !/^\s*>/.test(lines[i]) && !/^(#{1,6})\s+/.test(lines[i]) && !/^\s*(---+|\*\*\*+)\s*$/.test(lines[i])) {
+      para.push(lines[i]); i++;
+    }
+    out.push("<p>" + mdInline(para.join("\n")).replace(/\n/g, "<br>") + "</p>");
+  }
+  let html = out.join("\n");
+  html = html.replace(/(\/api\/file\/[0-9a-f]{32})/g, (m) => `<a class="file" href="${m}" target="_blank" rel="noopener">abrir adjunto</a>`);
+  return html;
 }
 function render(m) {
   const wrap = document.createElement("div");
@@ -347,6 +398,8 @@ async function pushState(btn) {
     const reg = await navigator.serviceWorker.ready;
     const sub = await reg.pushManager.getSubscription();
     if (sub) {
+      // ¿El servidor sigue teniendo esta suscripcion? Si no, la damos de baja
+      // tambien en local para que el boton refleje la realidad.
       const st = await api("/api/push/status", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ endpoint: sub.endpoint }),
