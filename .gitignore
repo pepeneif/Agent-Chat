@@ -1,0 +1,10 @@
+# secretos y datos en runtime — NUNCA al repo
+.env
+data/
+vapid.json
+*.log
+
+# pruebas / backups
+*.bak-*
+__pycache__/
+*.pyc

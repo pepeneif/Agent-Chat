@@ -1,0 +1,19 @@
+[Unit]
+Description=Agent-Chat backend (private chat PWA)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+Group=CHANGE_ME
+WorkingDirectory=/home/CHANGE_ME/agent-chat
+EnvironmentFile=/home/CHANGE_ME/agent-chat/.env
+ExecStart=/usr/bin/python3 /home/CHANGE_ME/agent-chat/server.py
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
