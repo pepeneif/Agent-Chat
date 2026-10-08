@@ -97,7 +97,52 @@ sudo systemctl enable --now chat-backend
 
 ## Configuración
 
-Todo va por variables de entorno (`.env`). Ver `.env.example`.
+Todo va por variables de entorno, en un fichero **`.env`** (copia `.env.example`).
+**Nada de esto va en el código**: así puedes publicarlo o compartirlo sin filtrar datos.
+
+### Quién puede entrar (`CHAT_OWNER`)
+
+Esta variable define **el único email autorizado**: a ese correo se le manda el
+código de acceso de un solo uso. El email **no está en el código fuente**; lo pones tú
+en tu `.env` privado:
+
+```env
+CHAT_OWNER=tu@ejemplo.com
+```
+
+Reglas:
+- **Uno solo** por instancia (es un chat privado de una persona con su agente).
+- En **minúsculas**; la comparación es exacta.
+- Si `CHAT_OWNER` está vacío, **nadie** puede pedir token (la instancia queda cerrada
+  hasta que lo configures). Es a propósito, para no dejar un chat abierto por descuido.
+
+### Remitente del código de acceso (`MAIL_FROM_*`, `SMTP_*`)
+
+El código se envía por **SMTP directo al MX del dominio emisor** (sin relay).
+
+```env
+MAIL_FROM_NAME=Agent Chat
+MAIL_FROM_ADDR=no-reply@ejemplo.com
+MAIL_FROM_DOMAIN=ejemplo.com
+SMTP_HOST=mx.de-ejemplo.com
+SMTP_PORT=25
+```
+
+- `MAIL_FROM_ADDR` debe pertenecer a `MAIL_FROM_DOMAIN` (es lo que se declara en el
+  `EHLO`/`MAIL FROM`); si no, muchos MX lo rechazan.
+- Si prefieres un relay local (Postfix en `127.0.0.1:25`), apunta `SMTP_HOST` ahí.
+
+El resto de variables:
+
+| Variable | Para qué |
+|---|---|
+| `CHAT_PORT` | puerto local (por defecto 8792) |
+| `CHAT_DATA` / `CHAT_STATIC` | rutas de datos y de estáticos |
+| `OMB_URL` | API local del agente (por defecto `http://127.0.0.1:8799`) |
+| `OMB_BOT_ID` / `OMB_THREAD_ID` | bot e hilo donde vive la conversación |
+| `VAPID_SUB` | contacto para las notificaciones push (`mailto:...`) |
+
+> **Nunca subas `.env` ni `data/` al repo.** El `.gitignore` ya los excluye.
 
 | Variable | Para qué |
 |---|---|
