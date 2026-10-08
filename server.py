@@ -65,6 +65,7 @@ except Exception:
 _dblock = threading.Lock()
 _dispatch_lock = threading.Lock()   # serializa los turnos: un dispatch a la vez
 _busy = {"on": False, "since": 0, "q": 0}   # hay un turno en curso (para avisar al cliente)
+_mirror = {"on": False}   # hay un hilo "espejo" siguiendo el hilo del agente
 
 # ---------- db ----------
 def db():
@@ -202,6 +203,59 @@ def bot_turns_since(since_ms):
                 t["last"], t["last_at"] = body, at
     return {k: v for k, v in turns.items() if v["last"]}
 
+MIRROR_GRACE   = 150   # s de silencio total tras el ultimo texto antes de cerrar el espejo
+MIRROR_MAX     = 1800  # s de tope duro del espejo (red de seguridad)
+MIRROR_POLL    = 2     # s entre lecturas del hilo
+MIRROR_SETTLE  = 8     # s de quietud antes de publicar (evita cortar a mitad)
+
+def _publish(role, text):
+    """Publica un mensaje del bot en el chat (si no estaba ya) y avisa por push."""
+    if not text or not text.strip():
+        return
+    if already_sent(role, text):
+        return
+    add_msg(role, text)
+    threading.Thread(target=send_push, args=("Manager", text), daemon=True).start()
+
+def _mirror_follow(t0):
+    """Espeja el hilo del agente AL MARGEN del dispatch.
+
+    El backend solo copiaba los mensajes anteriores al disparo del turno y dejaba de
+    mirar al llegar el 'digest'; en turnos largos la respuesta final (posterior al
+    digest) se perdia. Este hilo lee el hilo hasta que queda en silencio, y publica
+    cualquier texto del bot que no este todavia en el chat.
+    """
+    grace = MIRROR_GRACE
+    hard = time.time() + MIRROR_MAX
+    try:
+        while time.time() < hard:
+            time.sleep(MIRROR_POLL)
+            try:
+                turns = bot_turns_since(t0)
+            except Exception:
+                continue
+            if not turns:
+                continue
+            for t in sorted(turns.values(), key=lambda x: x["last_at"]):
+                for txt in (t["first"], t["last"]):
+                    _publish("bot", txt)
+            now = now_ms()
+            idle = (now - max((t["last_at"] for t in turns.values()), default=now)) / 1000.0
+            if idle < 0:
+                idle = 0
+            if idle >= grace:
+                break
+    except Exception as e:
+        print("mirror error:", e, flush=True)
+    finally:
+        _mirror["on"] = False
+
+def _start_mirror(t0):
+    if _mirror["on"]:
+        return
+    _mirror["on"] = True
+    threading.Thread(target=_mirror_follow, args=(t0,), daemon=True).start()
+
 def send_push(title, body):
     if not (_HAS_PUSH and VAPID.get("private_key")):
         return
@@ -255,6 +309,7 @@ def _dispatch_locked(text, uid=None):
     except Exception as e:
         add_msg("system", f"No se pudo disparar el turno: {e}")
         return
+    _start_mirror(t0)          # red de seguridad: publica lo que el dispatch no copie
     deadline = time.time() + 600
     acked = ""
     last_seen = ""
@@ -655,5 +710,6 @@ def recover_pending():
 if __name__ == "__main__":
     init_db()
     recover_pending()
+    _start_mirror(now_ms() - 30 * 60 * 1000)   # ultimos 30 min, por si quedo algo sin publicar
     print(f"chat backend on 127.0.0.1:{PORT}  data={DATA_DIR}", flush=True)
     Server(("127.0.0.1", PORT), Handler).serve_forever()
