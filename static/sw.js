@@ -1,4 +1,4 @@
-const CACHE = "chat-pwa-v14";
+const CACHE = "chat-pwa-v15";
 const ASSETS = ["/", "/index.html", "/theme.css", "/app.js", "/icon.svg", "/icon-512.png", "/apple-touch-icon.png", "/manifest.webmanifest"];
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
@@ -6,6 +6,12 @@ self.addEventListener("install", (e) => {
 self.addEventListener("activate", (e) => {
   e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
 });
+let lastVisibleAt = 0;
+self.addEventListener("message", (e) => {
+  const d = e.data || {};
+  if (d.type === "vis") lastVisibleAt = d.visible ? Date.now() : 0;
+});
+
 self.addEventListener("push", (e) => {
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: (e.data && e.data.text && e.data.text()) || "" }; }
@@ -14,11 +20,12 @@ self.addEventListener("push", (e) => {
   e.waitUntil((async () => {
     // Si ya hay una ventana del chat visible, no notificamos: el usuario esta leyendo.
     try {
+      const fresh = (Date.now() - lastVisibleAt) < 16000;
       const ws = await clients.matchAll({ type: "window", includeUncontrolled: true });
-      const visible = ws.some((w) => w.visibilityState === "visible" && !w.closed);
-      if (visible) {
-        ws.forEach((w) => { if ("postMessage" in w && w.visibilityState === "visible") w.postMessage({ type: "new-message" }); });
-        return;   // sin notificacion
+      const anyVisible = ws.some((w) => w.visibilityState === "visible" && !w.closed);
+      if (fresh && anyVisible) {
+        ws.forEach((w) => { if ("postMessage" in w) w.postMessage({ type: "new-message" }); });
+        return;   // el usuario esta mirando el chat: sin notificacion
       }
     } catch (_) {}
     await self.registration.showNotification(title, {

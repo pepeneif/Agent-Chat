@@ -302,6 +302,26 @@ function setNotifyBtn(btn, state) {
   else if (state === "error") btn.textContent = "Avisos error";
   else btn.textContent = "Avisos";
 }
+function startHeartbeat(reg) {
+  const send = () => {
+    try {
+      const t = (reg && reg.active) || navigator.serviceWorker.controller;
+      if (t) t.postMessage({ type: "vis", visible: !document.hidden && document.visibilityState === "visible" });
+    } catch (e) {}
+  };
+  const hide = () => {
+    try {
+      const t = (reg && reg.active) || navigator.serviceWorker.controller;
+      if (t) t.postMessage({ type: "vis", visible: false });
+    } catch (e) {}
+  };
+  send();
+  setInterval(send, 8000);
+  document.addEventListener("visibilitychange", send);
+  window.addEventListener("focus", send);
+  window.addEventListener("blur", send);
+  window.addEventListener("pagehide", hide);
+}
 function showBanner(on, txt) {
   const b = $("pushBanner");
   if (!b) return;
@@ -379,6 +399,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("/sw.js").then(() => pushState($("btnNotify"))).catch(() => {});
+    navigator.serviceWorker.register("/sw.js").then((reg) => { pushState($("btnNotify")); startHeartbeat(reg); }).catch(() => {});
   }
 });
