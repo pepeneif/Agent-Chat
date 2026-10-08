@@ -104,6 +104,29 @@ function scrollToTopOf(el, offset) {
   s.scrollTop = target;
   s.style.scrollBehavior = prev || "";
 }
+function revealMessage(el, topPad, botPad) {
+  // Si el mensaje CABE en la pantalla, alineamos su parte inferior con la inferior
+  // (se ve entero). Si NO cabe, alineamos su parte superior con la superior
+  // (se ve el principio, que es lo que se empieza a leer).
+  const s = $("scroll");
+  if (!s || !el) return;
+  const sbox = s.getBoundingClientRect();
+  const box = el.getBoundingClientRect();
+  const topPadV = topPad == null ? 8 : topPad;
+  const botPadV = botPad == null ? 12 : botPad;
+  const fits = (box.height + topPadV + botPadV) <= s.clientHeight;
+  const prev = s.style.scrollBehavior;
+  s.style.scrollBehavior = "auto";   // salto, sin animacion lenta
+  if (fits) {
+    const bottom = box.bottom - sbox.top + s.scrollTop;
+    s.scrollTop = Math.max(0, bottom - s.clientHeight + botPadV);
+  } else {
+    const top = box.top - sbox.top + s.scrollTop;
+    s.scrollTop = Math.max(0, top - topPadV);
+  }
+  s.style.scrollBehavior = prev || "";
+}
+
 function scrollBottomOf(el, offset) {
   const s = $("scroll");
   if (!s || !el) return;
@@ -150,7 +173,7 @@ async function tick() {
     if (mine >= 0) { scrollBottomOf(els[mine]); state.awaitOwn = false; }
     else if (msgs.length && stick) scrollToTopOf(els[0]);
   } else if (msgs.length && stick) {
-    scrollToTopOf(els[0]);   // ver el principio del mensaje nuevo
+    revealMessage(els[0]);   // entero si cabe; si no, su principio
   }
   if (hadBot) { state.sending = false; $("btnSend").disabled = false; }
 }
