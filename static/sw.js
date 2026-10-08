@@ -1,4 +1,4 @@
-const CACHE = "chat-pwa-v10";
+const CACHE = "chat-pwa-v11";
 const ASSETS = ["/", "/index.html", "/theme.css", "/app.js", "/icon.svg", "/icon-512.png", "/apple-touch-icon.png", "/manifest.webmanifest"];
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
@@ -11,15 +11,26 @@ self.addEventListener("push", (e) => {
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: (e.data && e.data.text && e.data.text()) || "" }; }
   const title = d.title || "Manager";
   const body = d.body || "Nuevo mensaje";
-  e.waitUntil(self.registration.showNotification(title, {
-    body: body.slice(0, 300),
-    icon: "/icon-512.png",
-    badge: "/apple-touch-icon.png",
-    vibrate: [120, 80, 120],
-    tag: "manager-msg",
-    renotify: true,
-    data: { url: "/" },
-  }));
+  e.waitUntil((async () => {
+    // Si ya hay una ventana del chat visible, no notificamos: el usuario esta leyendo.
+    try {
+      const ws = await clients.matchAll({ type: "window", includeUncontrolled: true });
+      const visible = ws.some((w) => w.visibilityState === "visible" && !w.closed);
+      if (visible) {
+        ws.forEach((w) => { if ("postMessage" in w && w.visibilityState === "visible") w.postMessage({ type: "new-message" }); });
+        return;   // sin notificacion
+      }
+    } catch (_) {}
+    await self.registration.showNotification(title, {
+      body: body.slice(0, 300),
+      icon: "/icon-512.png",
+      badge: "/apple-touch-icon.png",
+      vibrate: [120, 80, 120],
+      tag: "manager-msg",
+      renotify: true,
+      data: { url: "/" },
+    });
+  })());
 });
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
