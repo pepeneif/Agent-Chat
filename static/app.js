@@ -82,7 +82,17 @@ function render(m) {
   });
   return wrap;
 }
-function scrollDown() { const s = $("scroll"); s.scrollTop = s.scrollHeight; }
+function atBottom(s, slack) {
+  if (!s) return true;
+  return (s.scrollHeight - s.scrollTop - s.clientHeight) <= (slack == null ? 80 : slack);
+}
+function scrollDown(force) {
+  const s = $("scroll");
+  if (!s) return;
+  if (!force && !atBottom(s)) return;   // si estas leyendo arriba, NO te arrastro
+  s.scrollTop = s.scrollHeight;
+}
+let _stickBottom = true;
 function append(m) { $("scroll").appendChild(render(m)); }
 
 async function loadHistory() {
@@ -90,13 +100,14 @@ async function loadHistory() {
   if (r.status === 401) { showLogin(); return; }
   const s = $("scroll"); s.innerHTML = "";
   (r.data.messages || []).forEach((m) => { append(m); if (m.at > state.lastAt) state.lastAt = m.at; });
-  scrollDown();
+  scrollDown(true);
 }
 
 /* ---------------- polling ---------------- */
 async function tick() {
   const r = await api("/api/history?limit=40");
   if (r.status === 401) { stopPolling(); showLogin(); return; }
+  if (r.data && typeof r.data.busy === "boolean") setTyping(r.data.busy, r.data.busySince);
   const msgs = (r.data.messages || []).filter((m) => m.at > state.lastAt);
   const hadBot = msgs.some((m) => m.role === "bot" || m.role === "system");
   msgs.sort((a, b) => a.at - b.at).forEach((m) => {
@@ -104,11 +115,22 @@ async function tick() {
     if (m.at > state.lastAt) state.lastAt = m.at;
   });
   if (msgs.length) scrollDown();
-  if (hadBot) { state.sending = false; setTyping(false); $("btnSend").disabled = false; }
+  if (hadBot) { state.sending = false; $("btnSend").disabled = false; }
 }
 function startPolling() { stopPolling(); state.timer = setInterval(tick, 1000); tick(); }
 function stopPolling() { if (state.timer) clearInterval(state.timer); state.timer = null; }
-function setTyping(on) { $("typing").classList.toggle("hidden", !on); scrollDown(); }
+function setTyping(on, sinceMs) {
+  const el = $("typing");
+  if (on && sinceMs) {
+    const secs = Math.max(0, Math.round((Date.now() - sinceMs) / 1000));
+    el.textContent = secs > 3
+      ? "Manager esta trabajando... (" + secs + "s)"
+      : "Manager esta trabajando...";
+  } else if (on) {
+    el.textContent = "Manager esta trabajando...";
+  }
+  el.classList.toggle("hidden", !on);
+}
 
 /* ---------------- composer ---------------- */
 function autosize() {
@@ -150,6 +172,7 @@ async function send() {
   if (!r.ok) { state.sending = false; $("btnSend").disabled = false; alert("No se pudo enviar."); return; }
   $("text").value = ""; autosize();
   state.pending = []; $("attachrow").innerHTML = "";
+  scrollDown(true);
   setTyping(true);
   setTimeout(tick, 600);
 }

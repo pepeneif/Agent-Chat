@@ -63,6 +63,8 @@ try:
 except Exception:
     VAPID = {}
 _dblock = threading.Lock()
+_dispatch_lock = threading.Lock()   # serializa los turnos: un dispatch a la vez
+_busy = {"on": False, "since": 0, "q": 0}   # hay un turno en curso (para avisar al cliente)
 
 # ---------- db ----------
 def db():
@@ -94,6 +96,19 @@ def add_msg(role, content, uid=None):
         c.execute("INSERT INTO messages(id,role,content,at,uid) VALUES(?,?,?,?,?)",
                   (mid, role, content, now_ms(), uid))
     return {"id": mid, "role": role, "content": content, "at": now_ms()}
+
+def already_sent(role, content):
+    """True si ese mismo texto ya esta guardado (evita publicar la respuesta por duplicado)."""
+    if not content:
+        return False
+    try:
+        with db() as c:
+            row = c.execute(
+                "SELECT 1 FROM messages WHERE role=? AND content=? LIMIT 1",
+                (role, content)).fetchone()
+        return bool(row)
+    except Exception:
+        return False
 
 def history(limit=60, before=None):
     with db() as c:
@@ -214,7 +229,25 @@ def send_push(title, body):
             pass
 
 def dispatch(text, uid=None):
-    """Guarda el mensaje del usuario, dispara el turno de Manager y espera su respuesta."""
+    """Guarda el mensaje del usuario, dispara el turno del agente y espera su respuesta.
+
+    Serializado con `_dispatch_lock`: si dos turnos se solapan, el segundo espera a que
+    el primero cierre. Sin esto, dos hilos leen los mismos mensajes del bot y publican la
+    respuesta por duplicado (bug observado 2026-10-08).
+    """
+    with _dispatch_lock:
+        _busy["on"] = True
+        _busy["since"] = now_ms()
+        _busy["q"] += 1
+        try:
+            _dispatch_locked(text, uid)
+        finally:
+            _busy["q"] -= 1
+            if _busy["q"] <= 0:
+                _busy["q"] = 0
+                _busy["on"] = False
+
+def _dispatch_locked(text, uid=None):
     add_msg("user", text, uid)
     t0 = now_ms()
     try:
@@ -243,9 +276,10 @@ def dispatch(text, uid=None):
         if ready:
             final = "\n\n".join(t["last"] for t in ready)
             if final.strip() and final.strip() != acked.strip():
-                add_msg("bot", final)
-                threading.Thread(target=send_push, args=("Manager", final), daemon=True).start()
-            elif final.strip():
+                if not already_sent("bot", final):
+                    add_msg("bot", final)
+                    threading.Thread(target=send_push, args=("Manager", final), daemon=True).start()
+            elif final.strip() and not already_sent("bot", final):
                 threading.Thread(target=send_push, args=("Manager", final), daemon=True).start()
             return
 
@@ -351,7 +385,9 @@ class Handler(BaseHTTPRequestHandler):
                 q = parse_qs(u.query)
                 before = q.get("before", [None])[0]
                 lim = min(int(q.get("limit", ["60"])[0] or 60), 200)
-                return self._json(200, {"messages": history(lim, before)})
+                return self._json(200, {"messages": history(lim, before),
+                                         "busy": bool(_busy["on"]),
+                                         "busySince": int(_busy["since"] or 0)})
             if p.startswith("/api/file/"):
                 if not self._require():
                     return

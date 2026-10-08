@@ -21,6 +21,10 @@ para el chat en sí; solo `pywebpush` para las notificaciones.
 - **Notificaciones push** (sonido, app cerrada) mediante VAPID + service worker.
 - **Acuse rápido + respuesta final**: en cuanto el agente empieza a responder se publica
   un primer mensaje corto, y al terminar llega la respuesta completa. Nunca te deja colgado.
+- **Indicador "está trabajando… (Ns)"** durante todo el turno, con los segundos que lleva.
+- **Un turno a la vez**: los mensajes se serializan, y una respuesta nunca se publica dos veces.
+- **El scroll respeta al lector**: mientras lees hacia arriba, la vista no se mueve sola;
+  solo baja si ya estabas al final.
 - **Detección de turnos perdidos**: si el backend se reinicia con un turno en curso,
   al arrancar re-dispara el último mensaje sin respuesta.
 
