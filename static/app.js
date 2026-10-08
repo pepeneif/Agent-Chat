@@ -93,7 +93,23 @@ function scrollDown(force) {
   s.scrollTop = s.scrollHeight;
 }
 let _stickBottom = true;
-function append(m) { $("scroll").appendChild(render(m)); }
+
+function scrollToTopOf(el, offset) {
+  const s = $("scroll");
+  if (!s || !el) return;
+  const top = el.getBoundingClientRect().top - s.getBoundingClientRect().top + s.scrollTop;
+  const target = Math.max(0, top - (offset == null ? 8 : offset));
+  const prev = s.style.scrollBehavior;
+  s.style.scrollBehavior = "auto";   // salto, sin animacion lenta
+  s.scrollTop = target;
+  s.style.scrollBehavior = prev || "";
+}
+function append(m) {
+  const el = render(m);
+  el.dataset.at = String(m.at || 0);
+  $("scroll").appendChild(el);
+  return el;
+}
 
 async function loadHistory() {
   const r = await api("/api/history?limit=80");
@@ -110,11 +126,14 @@ async function tick() {
   if (r.data && typeof r.data.busy === "boolean") setTyping(r.data.busy, r.data.busySince);
   const msgs = (r.data.messages || []).filter((m) => m.at > state.lastAt);
   const hadBot = msgs.some((m) => m.role === "bot" || m.role === "system");
-  msgs.sort((a, b) => a.at - b.at).forEach((m) => {
-    append(m);
+  const stick = atBottom($("scroll"));   // decidir ANTES de insertar
+  msgs.sort((a, b) => a.at - b.at);
+  const els = msgs.map((m) => {
+    const el = append(m);
     if (m.at > state.lastAt) state.lastAt = m.at;
+    return el;
   });
-  if (msgs.length) scrollDown();
+  if (msgs.length && stick) scrollToTopOf(els[0]);   // ver el principio del mensaje nuevo
   if (hadBot) { state.sending = false; $("btnSend").disabled = false; }
 }
 function startPolling() { stopPolling(); state.timer = setInterval(tick, 1000); tick(); }
