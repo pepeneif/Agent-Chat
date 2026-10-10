@@ -32,6 +32,9 @@ para el chat en sí; solo `pywebpush` para las notificaciones.
 - **Un turno a la vez**: los mensajes se serializan, y una respuesta nunca se publica dos veces.
 - **El scroll respeta al lector**: mientras lees hacia arriba, la vista no se mueve sola;
   solo baja si ya estabas al final.
+- **Flechita "ir al final"**: pegada a la derecha del indicador de trabajo, con los colores
+  de tus burbujas. Aparece cuando hay mensajes por debajo (subiste a mano o la PWA abrió
+  arriba) o mientras el agente trabaja, y baja de golpe hasta el último mensaje.
 - **Detección de turnos perdidos**: si el backend se reinicia con un turno en curso,
   al arrancar re-dispara el último mensaje sin respuesta.
 

@@ -199,6 +199,22 @@ function render(m) {
   });
   return wrap;
 }
+function jumpEl() { return $("btnJump"); }
+function _updJump() {
+  const b = jumpEl(), s = $("scroll");
+  if (!b || !s) return;
+  const up = !atBottom(s, 40);     // hay contenido por debajo del borde inferior
+  const vis = up || !$("typing").classList.contains("hidden");
+  b.classList.toggle("hidden", !vis);
+}
+function jumpToEnd() {
+  _stickBottom = true;
+  const s = $("scroll");
+  if (s) { _forceBottom(s); pinBottom(); }
+  const msgs = document.querySelectorAll(".msg");
+  if (msgs.length) revealMessage(msgs[msgs.length - 1]);
+  _updJump();
+}
 function atBottom(s, slack) {
   if (!s) return true;
   return (s.scrollHeight - s.scrollTop - s.clientHeight) <= (slack == null ? 80 : slack);
@@ -286,7 +302,8 @@ async function loadHistory() {
   _stickBottom = true;               // una carga limpia siempre arranca pegado al ultimo mensaje
   scrollDown(true);
   pinBottom();                       // y lo reafirmamos tras el layout (imagenes/markdown)
-  setTimeout(() => { const s2 = $("scroll"); if (s2 && _stickBottom) _forceBottom(s2); }, 300);
+  setTimeout(() => { const s2 = $("scroll"); if (s2 && _stickBottom) _forceBottom(s2); _updJump(); }, 300);
+  _updJump();
 }
 
 /* ---------------- polling ---------------- */
@@ -313,20 +330,23 @@ async function tick() {
     revealMessage(els[els.length - 1]);   // anclar el mensaje MAS NUEVO, no el primero del lote
   }
   if (hadBot) { state.sending = false; $("btnSend").disabled = false; }
+  _updJump();
 }
 function startPolling() { stopPolling(); state.timer = setInterval(tick, 1000); tick(); }
 function stopPolling() { if (state.timer) clearInterval(state.timer); state.timer = null; }
 function setTyping(on, sinceMs) {
   const el = $("typing");
+  const tx = $("typingText") || el;
   if (on && sinceMs) {
     const secs = Math.max(0, Math.round((Date.now() - sinceMs) / 1000));
-    el.textContent = secs > 3
+    tx.textContent = secs > 3
       ? "Manager esta trabajando... (" + secs + "s)"
       : "Manager esta trabajando...";
   } else if (on) {
-    el.textContent = "Manager esta trabajando...";
+    tx.textContent = "Manager esta trabajando...";
   }
   el.classList.toggle("hidden", !on);
+  _updJump();
 }
 
 /* ---------------- composer ---------------- */
@@ -594,13 +614,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     const gap = sc.scrollHeight - sc.scrollTop - sc.clientHeight;
     if (gap > 140) _stickBottom = false;
     else if (gap < 40) _stickBottom = true;
+    _updJump();
   }, { passive: true });
+  const jb = $("btnJump"); if (jb) jb.onclick = jumpToEnd;
   const me = await api("/api/me");
   if (me.ok && me.data && me.data.email) OWNER_EMAIL = String(me.data.email);
   if (me.ok && me.data && me.data.brand) {
     const b = String(me.data.brand);
     const bEl = document.querySelector(".brand"); if (bEl) bEl.textContent = b;
-    const tEl = $("typing"); if (tEl) tEl.textContent = b + " esta trabajando...";
+    const txEl = $("typingText"); if (txEl) txEl.textContent = b + " esta trabajando...";
     document.title = b;
   }
   if (me.ok && me.data && me.data.ok) showChat(); else showLogin();
