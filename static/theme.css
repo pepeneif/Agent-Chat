@@ -173,3 +173,12 @@ svg{display:block}
 .fix-zoom textarea#text,
 .fix-zoom input,
 .fix-zoom select{font-size:16px}
+
+/* Tablas markdown (2026-10-10): el chat las despliega como HTML real, no como markup. */
+.msg .bubble .tblwrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:6px 0}
+.msg .bubble table.md{border-collapse:collapse;width:100%;font-size:13.5px;line-height:1.4}
+.msg .bubble table.md th,
+.msg .bubble table.md td{border:1px solid var(--color-hairline);padding:6px 9px;vertical-align:top;text-align:left}
+.msg .bubble table.md th{background:var(--color-inset);font-weight:600;white-space:nowrap}
+.msg .bubble table.md tbody tr:nth-child(even) td{background:var(--color-panel)}
+.msg .bubble table.md code{white-space:nowrap}

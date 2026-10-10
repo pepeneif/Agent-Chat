@@ -89,6 +89,38 @@ function mdInline(s) {
   h = h.replace(/(^|\W)\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
   return h;
 }
+function _splitRow(line) {
+  let t = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return t.split("|").map(function (x) { return x.trim(); });
+}
+function _isAlignRow(line) {
+  if (line.indexOf("-") < 0) return false;
+  var cells = _splitRow(line);
+  return cells.length > 0 && cells.every(function (c) { return /^:?-{2,}:?$/.test(c.replace(/\s+/g, "")); });
+}
+function flushTable(rows, alignRow) {
+  if (!rows.length) return "";
+  var aligns = (alignRow || rows[0]).map(function (c) {
+    var t = c.replace(/\s+/g, "");
+    return t.charAt(0) === ":" && t.charAt(t.length - 1) === ":" ? "center"
+         : t.charAt(t.length - 1) === ":" ? "right" : "";
+  });
+  var head = "<thead><tr>" + rows[0].map(function (c, i) {
+    return "<th" + (aligns[i] ? ' style="text-align:' + aligns[i] + '"' : "") + ">" + mdInline(c) + "</th>";
+  }).join("") + "</tr></thead>";
+  var body = "";
+  if (rows.length > 1) {
+    body = "<tbody>" + rows.slice(1).map(function (r) {
+      // normalizar al ancho de la cabecera
+      var cells = r.slice(0, rows[0].length);
+      while (cells.length < rows[0].length) cells.push("");
+      return "<tr>" + cells.map(function (c, i) {
+        return "<td" + (aligns[i] ? ' style="text-align:' + aligns[i] + '"' : "") + ">" + mdInline(c) + "</td>";
+      }).join("") + "</tr>";
+    }).join("") + "</tbody>";
+  }
+  return '<div class="tblwrap"><table class="md">' + head + body + "</table></div>";
+}
 function linkify(text) {
   const src = (text || "").replace(/\r\n?/g, "\n");
   const lines = src.split("\n");
@@ -108,6 +140,14 @@ function linkify(text) {
       const q = [];
       while (i < lines.length && /^\s*>\s?/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
       out.push("<blockquote>" + mdInline(q.join("\n")).replace(/\n/g, "<br>") + "</blockquote>");
+      continue;
+    }
+    if (/^\s*\|/.test(line) && i + 1 < lines.length && /^\s*\|/.test(lines[i + 1]) && _isAlignRow(lines[i + 1])) {
+      const rows = [_splitRow(line)];
+      const alignRow = _splitRow(lines[i + 1]);
+      i += 2;                                  // cabecera + fila separadora
+      while (i < lines.length && /^\s*\|/.test(lines[i])) { rows.push(_splitRow(lines[i])); i++; }
+      out.push(flushTable(rows, alignRow));
       continue;
     }
     if (liRe.test(line)) {
@@ -133,7 +173,7 @@ function linkify(text) {
     const para = [line];
     i++;
     while (i < lines.length && !/^\s*$/.test(lines[i]) && !liRe.test(lines[i]) && !olRe.test(lines[i])
-           && !/^\s*>/.test(lines[i]) && !/^(#{1,6})\s+/.test(lines[i]) && !/^\s*(---+|\*\*\*+)\s*$/.test(lines[i])) {
+           && !/^\s*>/.test(lines[i]) && !/^(#{1,6})\s+/.test(lines[i]) && !/^\s*(---+|\*\*\*+)\s*$/.test(lines[i]) && !/^\s*\|/.test(lines[i])) {
       para.push(lines[i]); i++;
     }
     out.push("<p>" + mdInline(para.join("\n")).replace(/\n/g, "<br>") + "</p>");

@@ -16,8 +16,9 @@ para el chat en sí; solo `pywebpush` para las notificaciones.
 
 - **Chat de texto** con burbujas, historial propio y adjuntos (imágenes y ficheros, hasta 25 MB).
 - **Formato ligero en los mensajes**: `**negritas**`, `` `código` ``, *cursiva*, listas
-  (con guion o numeradas), citas, títulos y separadores. Se renderiza sobre el texto ya
-  escapado, así que el contenido nunca puede inyectar HTML.
+  (con guion o numeradas), citas, títulos, separadores y **tablas markdown** (con
+  alineación por columnas `:---`/`:---:`/`---:` y scroll horizontal en móvil). Se
+  renderiza sobre el texto ya escapado, así que el contenido nunca puede inyectar HTML.
 - **Autenticación por código de un solo uso** enviado por email (sin contraseñas).
 - **Sesión de 30 días** en una cookie `HttpOnly`, `Secure`, `SameSite=Lax`.
 - **PWA instalable** en iOS/Android (Safari → *Añadir a pantalla de inicio*).
@@ -195,6 +196,22 @@ El resto de variables:
 - Un solo usuario por instancia.
 - Para varios usuarios/instancias, replica con otro `CHAT_PORT`, otro subdominio y
   otras claves VAPID.
+
+## Tablas markdown
+
+El render acepta tablas de GitHub:
+
+```
+| Columna A | Columna B |
+| --- | ---: |
+| valor | 42 |
+```
+
+La fila de guiones es obligatoria (dos o más guiones por celda) y admite alineación
+(`:---` izquierda, `:---:` centro, `---:` derecha). Si el ancho no cabe, la tabla se
+desplaza en horizontal dentro de su burbuja, sin romper el layout del chat.
+Al cambiar los estáticos, sube el número de `CACHE` en `static/sw.js` para que la PWA
+instalada vuelva a pedirlos.
 
 ## Contribuir
 
