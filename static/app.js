@@ -1,6 +1,12 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const state = { pending: [], lastAt: 0, timer: null, sending: false, awaitOwn: false };
+let OWNER_EMAIL = "";
+// Fix 3 (zoom al escribir) REVERSIBLE: para volver al comportamiento anterior, cambia a false.
+const FIX_COMPOSER_ZOOM = true;
+const FIX_ZOOM = FIX_COMPOSER_ZOOM;   // alias
+if (FIX_COMPOSER_ZOOM) document.documentElement.classList.add("fix-zoom");
+else document.documentElement.classList.add("no-fix-zoom");
 
 async function api(path, opts) {
   const r = await fetch(path, Object.assign({ credentials: "same-origin" }, opts || {}));
@@ -38,7 +44,7 @@ function showChat() {
 async function requestToken() {
   $("err").textContent = "";
   const b = $("btnToken"); b.disabled = true; b.textContent = "Enviando...";
-  const r = await api("/api/request-token", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) });
+  const r = await api("/api/request-token", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: OWNER_EMAIL }) });
   b.disabled = false; b.textContent = "Enviarme el codigo por email";
   if (!r.ok) { $("err").textContent = "No se pudo enviar. Intenta de nuevo."; return; }
   $("ok1").classList.remove("hidden");
@@ -50,9 +56,15 @@ async function verify() {
   const t = $("tok").value.trim();
   if (!t) { $("err").textContent = "Pega el codigo."; return; }
   const b = $("btnVerify"); b.disabled = true; b.textContent = "Comprobando...";
-  const r = await api("/api/verify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: t }) });
+  let r;
+  try {
+    r = await api("/api/verify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: t }) });
+  } catch (e) {
+    r = null;
+  }
   b.disabled = false; b.textContent = "Entrar";
-  if (!r.ok) { $("err").textContent = "Codigo invalido o caducado."; return; }
+  if (!r) { $("err").textContent = "No hubo conexion. Revisa tu red e intenta de nuevo."; return; }
+  if (!r.ok) { $("err").textContent = "Codigo invalido o caducado. Pide uno nuevo."; return; }
   $("tok").value = "";
   showChat();
 }
@@ -143,7 +155,7 @@ function render(m) {
   ids.forEach((u) => {
     const img = new Image();
     img.src = u; img.alt = "adjunto";
-    img.onload = () => { wrap.querySelector(".bubble").appendChild(img); scrollDown(); };
+    img.onload = () => { wrap.querySelector(".bubble").appendChild(img); if (_stickBottom) { scrollDown(); } };
   });
   return wrap;
 }
@@ -151,11 +163,26 @@ function atBottom(s, slack) {
   if (!s) return true;
   return (s.scrollHeight - s.scrollTop - s.clientHeight) <= (slack == null ? 80 : slack);
 }
+function _forceBottom(s) {
+  if (!s) return;
+  const prev = s.style.scrollBehavior;
+  s.style.scrollBehavior = "auto";   // salto inmediato: nada de scroll suave (causaba el desfase de ~90px)
+  s.scrollTop = s.scrollHeight;
+  s.style.scrollBehavior = prev || "";
+}
+// Reafirma el fondo tras un frame: el alto cambia cuando el layout/pintado terminan
+// (imagenes, fuentes, markdown). Sin esto el chat quedaba ~90px corto y se "soltaba".
+function pinBottom() {
+  requestAnimationFrame(() => { const s = $("scroll"); if (s) _forceBottom(s); });
+}
 function scrollDown(force) {
   const s = $("scroll");
   if (!s) return;
-  if (!force && !atBottom(s)) return;   // si estas leyendo arriba, NO te arrastro
-  s.scrollTop = s.scrollHeight;
+  // _stickBottom: pegado al fondo. Solo se suelta si el usuario sube a mano (listener mas abajo).
+  // Antes bastaba un desfase de 94px para que el chat se creyera "leyendo arriba" y se congelara.
+  if (!force && !_stickBottom && !atBottom(s, 120)) return;
+  _forceBottom(s);
+  pinBottom();
 }
 let _stickBottom = true;
 
@@ -216,7 +243,10 @@ async function loadHistory() {
   if (r.status === 401) { showLogin(); return; }
   const s = $("scroll"); s.innerHTML = "";
   (r.data.messages || []).forEach((m) => { append(m); if (m.at > state.lastAt) state.lastAt = m.at; });
+  _stickBottom = true;               // una carga limpia siempre arranca pegado al ultimo mensaje
   scrollDown(true);
+  pinBottom();                       // y lo reafirmamos tras el layout (imagenes/markdown)
+  setTimeout(() => { const s2 = $("scroll"); if (s2 && _stickBottom) _forceBottom(s2); }, 300);
 }
 
 /* ---------------- polling ---------------- */
@@ -226,7 +256,9 @@ async function tick() {
   if (r.data && typeof r.data.busy === "boolean") setTyping(r.data.busy, r.data.busySince);
   const msgs = (r.data.messages || []).filter((m) => m.at > state.lastAt);
   const hadBot = msgs.some((m) => m.role === "bot" || m.role === "system");
-  const stick = atBottom($("scroll"));   // decidir ANTES de insertar
+  const near = atBottom($("scroll"), 120);  // medir ANTES de insertar
+  if (near) _stickBottom = true;            // el usuario estaba abajo -> seguimos pegados
+  const stick = _stickBottom;               // fuente de verdad: el flag, no un unico umbral
   msgs.sort((a, b) => a.at - b.at);
   const els = msgs.map((m) => {
     const el = append(m);
@@ -317,6 +349,7 @@ async function disablePush(btn) {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ endpoint: sub.endpoint }),
       });
+      try { await api("/api/push/prefs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) }); } catch (e) {}
       try { await sub.unsubscribe(); } catch (e) {}
     }
     setNotifyBtn(btn, "off");
@@ -343,11 +376,14 @@ async function enablePush(btn) {
         applicationServerKey: b64ToU8(kr.data.key),
       });
     }
+    // Siempre (re)registramos en el servidor: si iOS renovo el endpoint y el server
+    // no lo tenia, esto lo vuelve a dar de alta (auto-reparable). Fix 4.
     const r = await api("/api/push/subscribe", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ subscription: sub.toJSON() }),
     });
     if (r.ok) {
+      try { await api("/api/push/prefs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) }); } catch (e) {}
       setNotifyBtn(btn, "on");
       showBanner(false);
       api("/api/push/test", { method: "POST" });
@@ -405,26 +441,45 @@ async function pushState(btn) {
       showBanner(true, "Avisos bloqueados. Ve a Ajustes > Notificaciones > Chat y activalos.");
       return;
     }
+    // Preferencia persistente (servidor). Decide si los avisos deben estar ON por defecto.
+    let pref = true;
+    try {
+      const pr = await api("/api/push/prefs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) });
+      if (pr.ok && pr.data && pr.data.enabled === false) pref = false;
+    } catch (e) {}
+
     const reg = await navigator.serviceWorker.ready;
     const sub = await reg.pushManager.getSubscription();
+
+    // Helper: crea (si hace falta) y registra la suscripcion en el servidor.
+    const ensureRegistered = async () => {
+      try {
+        const kr = await api("/api/push/key");
+        if (!kr.ok || !kr.data || !kr.data.key) { setNotifyBtn(btn, "error"); showBanner(true, "El servidor no tiene push configurado."); return; }
+        const cur = await reg.pushManager.getSubscription();
+        const s = cur || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToU8(kr.data.key) });
+        const rs = await api("/api/push/subscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ subscription: s.toJSON() }) });
+        if (rs.ok) { setNotifyBtn(btn, "on"); showBanner(false); }
+        else { setNotifyBtn(btn, "error"); showBanner(true, "No se pudieron activar los avisos."); }
+      } catch (e) { setNotifyBtn(btn, "error"); showBanner(true, "Error activando avisos: " + e.message); }
+    };
+
     if (sub) {
-      // ¿El servidor sigue teniendo esta suscripcion? Si no, la damos de baja
-      // tambien en local para que el boton refleje la realidad.
-      const st = await api("/api/push/status", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ endpoint: sub.endpoint }),
-      });
+      // Hay suscripcion local. Si la preferencia es OFF, respetamos OFF.
+      if (!pref) { setNotifyBtn(btn, "off"); showBanner(true, "Avisos desactivados. Toca Avisos OFF para volver a activarlos."); return; }
+      const st = await api("/api/push/status", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: sub.endpoint }) });
       if (st.ok && st.data && st.data.registered) { setNotifyBtn(btn, "on"); showBanner(false); return; }
-      try { await sub.unsubscribe(); } catch (e) {}
-      setNotifyBtn(btn, "off");
-      showBanner(true, "Avisos desactivados. Toca Avisos OFF para volver a activarlos.");
+      // El servidor no la tenia (endpoint renovado por iOS): la volvemos a registrar.
+      const rs = await api("/api/push/subscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ subscription: sub.toJSON() }) });
+      if (rs.ok) { setNotifyBtn(btn, "on"); showBanner(false); return; }
+      setNotifyBtn(btn, "error"); showBanner(true, "No se pudieron verificar los avisos.");
       return;
     }
-    if (Notification.permission === "granted") {
-      setNotifyBtn(btn, "off");
-      showBanner(true, "Avisos desactivados. Toca Avisos OFF para volver a activarlos.");
-      return;
-    }
+
+    // No hay suscripcion local (iOS la solto sola). Fix 4b: si la preferencia es ON y ya
+    // hay permiso, la RECREAMOS nosotros en vez de pedir que la reactives a mano.
+    if (pref && Notification.permission === "granted") { await ensureRegistered(); return; }
+    if (Notification.permission === "granted") { setNotifyBtn(btn, "off"); showBanner(true, "Avisos desactivados. Toca Avisos OFF para volver a activarlos."); return; }
     setNotifyBtn(btn, "plain");
     showBanner(true, "Activa los avisos para que te suene el movil cuando te escriba.");
   } catch (e) { setNotifyBtn(btn, "error"); showBanner(true, "Error consultando avisos: " + e.message); }
@@ -486,12 +541,28 @@ window.addEventListener("DOMContentLoaded", async () => {
     const btn = $("btnNotify");
     const reg = await navigator.serviceWorker.ready.catch(() => null);
     const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
-    if (sub) await disablePush(btn); else await enablePush(btn);
+    const off = btn.classList.contains("off");
+    if (sub && !off) await disablePush(btn); else await enablePush(btn);
   };
   $("btnNotify").onclick = onNotify;
   $("btnPushGo").onclick = () => enablePush($("btnNotify"));
 
+  // Pegado al fondo: si el usuario arrastra arriba, paramos de arrastrarle; si vuelve
+  // abajo, volvemos a pegarnos. Es la pieza que faltaba (el flag estaba declarado y sin usar).
+  const sc = $("scroll");
+  if (sc) sc.addEventListener("scroll", () => {
+    const gap = sc.scrollHeight - sc.scrollTop - sc.clientHeight;
+    if (gap > 140) _stickBottom = false;
+    else if (gap < 40) _stickBottom = true;
+  }, { passive: true });
   const me = await api("/api/me");
+  if (me.ok && me.data && me.data.email) OWNER_EMAIL = String(me.data.email);
+  if (me.ok && me.data && me.data.brand) {
+    const b = String(me.data.brand);
+    const bEl = document.querySelector(".brand"); if (bEl) bEl.textContent = b;
+    const tEl = $("typing"); if (tEl) tEl.textContent = b + " esta trabajando...";
+    document.title = b;
+  }
   if (me.ok && me.data && me.data.ok) showChat(); else showLogin();
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) pushState($("btnNotify"));
@@ -502,5 +573,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       if (e.data && e.data.type === "new-message") tick();
     });
     navigator.serviceWorker.register("/sw.js").then((reg) => { pushState($("btnNotify")); startHeartbeat(reg); }).catch(() => {});
+    // Auto-recuperacion: re-verifica los avisos cada 60 s mientras la app esta abierta.
+    setInterval(() => { if (!document.hidden) pushState($("btnNotify")); }, 60000);
   }
 });

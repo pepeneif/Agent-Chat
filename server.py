@@ -9,7 +9,7 @@ respuestas, con acuse rapido + respuesta final, y notificaciones Web Push (VAPID
 
 Toda la configuracion se toma de variables de entorno (ver .env.example).
 """
-import os, re, json, time, uuid, sqlite3, secrets, smtplib, threading, mimetypes, traceback
+import os, re, json, time, uuid, sqlite3, secrets, smtplib, threading, mimetypes, traceback, hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 from urllib.request import urlopen, Request
@@ -36,12 +36,13 @@ BOT_ID     = _env("OMB_BOT_ID")       # id del bot/agente que responde
 THREAD_ID  = _env("OMB_THREAD_ID")    # hilo dedicado donde vive la conversacion
 
 # Quien puede entrar (un solo email)
-OWNER      = _env("CHAT_OWNER", "").lower()
+OWNER      = _env("CHAT_OWNER", "").strip().lower()
+BRAND      = _env("CHAT_BRAND", "Manager").strip() or "Manager"
 
 # Correo saliente del codigo de acceso (SMTP directo al MX del dominio emisor)
-MAIL_FROM_H = _env("MAIL_FROM_NAME", "Agent Chat")
-MAIL_FROM_A = _env("MAIL_FROM_ADDR", "no-reply@example.com")
-MAIL_FROM_D = _env("MAIL_FROM_DOMAIN", "example.com")
+MAIL_FROM_H = _env("CHAT_MAIL_NAME", BRAND)
+MAIL_FROM_A = _env("CHAT_MAIL_FROM", "no-reply@example.com")
+MAIL_FROM_D = _env("CHAT_MAIL_DOMAIN", MAIL_FROM_A.split("@", 1)[1] if "@" in MAIL_FROM_A else "example.com")
 SMTP_HOST  = _env("SMTP_HOST", "127.0.0.1")
 SMTP_PORT  = int(_env("SMTP_PORT", "25"))
 
@@ -67,6 +68,8 @@ _dispatch_lock = threading.Lock()   # serializa los turnos: un dispatch a la vez
 _busy = {"on": False, "since": 0, "q": 0}   # hay un turno en curso (para avisar al cliente)
 _mirror = {"on": False}   # hay un hilo "espejo" siguiendo el hilo del agente
 _debuging = {"on": False}   # hay una depuracion en curso
+_viewer = {"last": 0}       # ultimo poll de /api/history: alguien mira la UI en primer plano
+VIEWER_TTL_MS = 25000       # margen: si hubo poll hace <25s, no mandamos push (esta leyendo)
 
 # ---------- db ----------
 def db():
@@ -88,9 +91,22 @@ def init_db():
             id TEXT PRIMARY KEY, name TEXT, mime TEXT, size INTEGER, created INTEGER);
         CREATE TABLE IF NOT EXISTS rl (k TEXT PRIMARY KEY, n INTEGER, ts INTEGER);
         CREATE TABLE IF NOT EXISTS push_subs (endpoint TEXT PRIMARY KEY, sub TEXT, created INTEGER);
+        CREATE TABLE IF NOT EXISTS prefs (k TEXT PRIMARY KEY, v TEXT);
         """)
 
 def now_ms(): return int(time.time() * 1000)
+
+def get_pref(k, default=None):
+    try:
+        with db() as c:
+            r = c.execute("SELECT v FROM prefs WHERE k=?", (k,)).fetchone()
+        return r["v"] if r else default
+    except Exception:
+        return default
+
+def set_pref(k, v):
+    with _dblock, db() as c:
+        c.execute("INSERT OR REPLACE INTO prefs(k,v) VALUES(?,?)", (k, str(v)))
 
 def add_msg(role, content, uid=None):
     mid = uuid.uuid4().hex
@@ -111,6 +127,47 @@ def already_sent(role, content):
         return bool(row)
     except Exception:
         return False
+
+_push_seen = {}
+_push_seen_lock = threading.Lock()
+
+def _push_once(text):
+    """Empuja la notificacion UNA vez por texto (dedupe 5 min), aunque varios hilos coincidan."""
+    if not text or not text.strip():
+        return
+    h = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
+    now = time.time()
+    with _push_seen_lock:
+        if _push_seen.get(h, 0) > now - 300:
+            return
+        _push_seen[h] = now
+    threading.Thread(target=send_push, args=(BRAND, text), daemon=True).start()
+
+def publish_bot(text, push=True):
+    """Publica un mensaje del bot EXACTAMENTE una vez (check+insert atomicos bajo _dblock).
+
+    Evita la carrera dispatch<->espejo (mismo texto insertado dos veces y dos avisos).
+    Devuelve True si inserto ahora; False si ya estaba.
+    """
+    if not text or not text.strip():
+        return False
+    ins = False
+    with _dblock:
+        c = sqlite3.connect(DB, timeout=15)
+        c.row_factory = sqlite3.Row
+        try:
+            row = c.execute("SELECT 1 FROM messages WHERE role='bot' AND content=? LIMIT 1",
+                            (text,)).fetchone()
+            if not row:
+                c.execute("INSERT INTO messages(id,role,content,at,uid) VALUES(?,?,?,?,?)",
+                          (uuid.uuid4().hex, "bot", text, now_ms(), None))
+                c.commit()
+                ins = True
+        finally:
+            c.close()
+    if push:
+        _push_once(text)
+    return ins
 
 def history(limit=60, before=None):
     with db() as c:
@@ -215,8 +272,8 @@ def purge_history(keep):
     return len(victims)
 
 def debug_worker(keep=None):
-    """Dispara la compactacion NATIVA del hilo del agente en OpenMausBot y poda el historial
-    del chat. Nunca toca el hilo con un turno en curso."""
+    """Dispara la compactacion NATIVA del hilo de OpenMausBot y poda el historial del chat.
+    Nunca toca el hilo con un turno en curso (regla del chat: no reiniciar/depurar en vivo)."""
     keep = DEBUG_KEEP if keep is None else keep
     _debug_busy(True)
     try:
@@ -288,13 +345,14 @@ MIRROR_POLL    = 2     # s entre lecturas del hilo
 MIRROR_SETTLE  = 8     # s de quietud antes de publicar (evita cortar a mitad)
 
 def _publish(role, text):
-    """Publica un mensaje del bot en el chat (si no estaba ya) y avisa por push."""
-    if not text or not text.strip():
+    """Publica un mensaje del bot en el chat (una sola vez) y avisa por push."""
+    if role == "bot":
+        publish_bot(text)
         return
-    if already_sent(role, text):
+    if not text or not text.strip() or already_sent(role, text):
         return
     add_msg(role, text)
-    threading.Thread(target=send_push, args=("Manager", text), daemon=True).start()
+    _push_once(text)
 
 def _mirror_follow(t0):
     """Espeja el hilo del agente AL MARGEN del dispatch.
@@ -334,8 +392,13 @@ def _start_mirror(t0):
     _mirror["on"] = True
     threading.Thread(target=_mirror_follow, args=(t0,), daemon=True).start()
 
-def send_push(title, body):
+def send_push(title, body, force=False):
     if not (_HAS_PUSH and VAPID.get("private_key")):
+        return
+    # Si la UI del chat estuvo en primer plano hace poco (poll reciente de /api/history),
+    # la persona esta leyendo: no duplicamos con una notificacion. Al minimizar, iOS congela la
+    # pagina, cesan los polls y a los ~25s vuelven los avisos. (force=para pruebas/push manual)
+    if not force and (now_ms() - _viewer["last"]) < VIEWER_TTL_MS:
         return
     try:
         with db() as c:
@@ -402,18 +465,17 @@ def _dispatch_locked(text, uid=None):
         # 1) acuse rapido: primer texto del turno, en cuanto aparece
         if not acked and ordered[0]["first"]:
             acked = ordered[0]["first"]
-            add_msg("bot", acked)
+            publish_bot(acked, push=False)
 
         # 2) respuesta final: al cerrarse el turno (llega su digest)
         ready = [t for t in ordered if t["ended"]]
         if ready:
             final = "\n\n".join((t.get("final") or t["last"]) for t in ready)
-            if final.strip() and final.strip() != acked.strip():
-                if not already_sent("bot", final):
-                    add_msg("bot", final)
-                    threading.Thread(target=send_push, args=("Manager", final), daemon=True).start()
-            elif final.strip() and not already_sent("bot", final):
-                threading.Thread(target=send_push, args=("Manager", final), daemon=True).start()
+            if final.strip():
+                # publish_bot inserta+empuja una sola vez; si ya estaba (p.ej. fue el acuse,
+                # que no empuja), _push_once asegura el aviso sin duplicarlo.
+                if not publish_bot(final):
+                    _push_once(final)
             return
 
         # 3) respaldo: hay texto pero el turno no cierra; si esta quieto 45 s, publicar
@@ -424,12 +486,10 @@ def _dispatch_locked(text, uid=None):
             stable = 0
             last_seen = cand
         if cand.strip() and cand.strip() != acked.strip() and stable >= 45:
-            add_msg("bot", cand)
-            threading.Thread(target=send_push, args=("Manager", cand), daemon=True).start()
+            publish_bot(cand)
             return
     if last_seen.strip() and last_seen.strip() != acked.strip():
-        add_msg("bot", last_seen)
-        threading.Thread(target=send_push, args=("Manager", last_seen), daemon=True).start()
+        publish_bot(last_seen)
     else:
         add_msg("system", "Manager no respondio a tiempo. El mensaje esta guardado.")
 
@@ -504,20 +564,27 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if p in ("/", "/index.html"):
                 return self._static("index.html")
-            if p in ("/manifest.webmanifest", "/sw.js", "/theme.css", "/app.js", "/icon.svg", "/icon-512.png", "/apple-touch-icon.png"):
+            if p == "/manifest.webmanifest":
+                return self._manifest()
+            if p in ("/sw.js", "/theme.css", "/app.js", "/icon.svg", "/icon-512.png", "/apple-touch-icon.png"):
                 return self._static(p.lstrip("/"))
             if p == "/api/me":
-                return self._json(200, {"ok": self._session_ok()})
+                return self._json(200, {"ok": self._session_ok(), "brand": BRAND, "email": OWNER})
             if p == "/api/push/key":
                 if not self._require():
                     return
                 return self._json(200, {"key": VAPID.get("public_key")})
+            if p == "/api/push/prefs":
+                if not self._require():
+                    return
+                return self._json(200, {"enabled": get_pref("push_enabled", "true") != "false"})
             if p == "/api/history":
                 if not self._require():
                     return
                 q = parse_qs(u.query)
                 before = q.get("before", [None])[0]
                 lim = min(int(q.get("limit", ["60"])[0] or 60), 200)
+                _viewer["last"] = now_ms()
                 return self._json(200, {"messages": history(lim, before),
                                          "busy": bool(_busy["on"]),
                                          "busySince": int(_busy["since"] or 0)})
@@ -560,8 +627,12 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/push/test":
                 if not self._require():
                     return
-                threading.Thread(target=send_push, args=("Manager", "Prueba de notificacion"), daemon=True).start()
+                threading.Thread(target=send_push, args=(BRAND, "Prueba de notificacion"), kwargs={"force": True}, daemon=True).start()
                 return self._json(200, {"ok": True})
+            if p == "/api/push/prefs":
+                if not self._require():
+                    return
+                return self._push_prefs_set()
             if p == "/api/send":
                 if not self._require():
                     return
@@ -576,6 +647,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(500, {"error": str(e)})
 
     # ---- static ----
+    def _manifest(self):
+        path = os.path.join(STATIC_DIR, "manifest.webmanifest")
+        try:
+            with open(path, encoding="utf-8") as f:
+                man = json.load(f)
+        except Exception:
+            man = {}
+        name = os.environ.get("CHAT_PWA_NAME", "").strip()
+        if name:
+            man["name"] = name
+        man["short_name"] = BRAND
+        return self._json(200, man)
+
     def _static(self, name):
         path = os.path.join(STATIC_DIR, name)
         if not os.path.isfile(path):
@@ -610,8 +694,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._rate_ok("ip:" + ip, 6, 3600):
             return self._json(429, {"error": "too many requests"})
         body = json.loads(self._body().decode("utf-8") or "{}")
-        email = (body.get("email") or OWNER or "").strip()
-        if not OWNER or email.lower() != OWNER:
+        email = (body.get("email") or "").strip()
+        if email.lower() != OWNER:
             time.sleep(1.0)
             return self._json(200, {"ok": True})
         tok = secrets.token_urlsafe(18)
@@ -709,6 +793,12 @@ class Handler(BaseHTTPRequestHandler):
         with db() as c:
             r = c.execute("SELECT 1 FROM push_subs WHERE endpoint=?", (endpoint,)).fetchone()
         return self._json(200, {"registered": bool(r)})
+
+    def _push_prefs_set(self):
+        body = json.loads(self._body().decode("utf-8") or "{}")
+        if "enabled" in body:
+            set_pref("push_enabled", "true" if body.get("enabled") else "false")
+        return self._json(200, {"enabled": get_pref("push_enabled", "true") != "false"})
 
     def _push_unsubscribe(self):
         body = json.loads(self._body().decode("utf-8") or "{}")

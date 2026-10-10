@@ -126,19 +126,19 @@ Reglas:
 - Si `CHAT_OWNER` está vacío, **nadie** puede pedir token (la instancia queda cerrada
   hasta que lo configures). Es a propósito, para no dejar un chat abierto por descuido.
 
-### Remitente del código de acceso (`MAIL_FROM_*`, `SMTP_*`)
+### Remitente del código de acceso (`CHAT_MAIL_*`, `SMTP_*`)
 
 El código se envía por **SMTP directo al MX del dominio emisor** (sin relay).
 
 ```env
-MAIL_FROM_NAME=Agent Chat
-MAIL_FROM_ADDR=no-reply@ejemplo.com
-MAIL_FROM_DOMAIN=ejemplo.com
+CHAT_MAIL_NAME=Agent Chat
+CHAT_MAIL_FROM=no-reply@ejemplo.com
+CHAT_MAIL_DOMAIN=ejemplo.com
 SMTP_HOST=mx.de-ejemplo.com
 SMTP_PORT=25
 ```
 
-- `MAIL_FROM_ADDR` debe pertenecer a `MAIL_FROM_DOMAIN` (es lo que se declara en el
+- `CHAT_MAIL_FROM` debe pertenecer a `CHAT_MAIL_DOMAIN` (es lo que se declara en el
   `EHLO`/`MAIL FROM`); si no, muchos MX lo rechazan.
 - Si prefieres un relay local (Postfix en `127.0.0.1:25`), apunta `SMTP_HOST` ahí.
 
@@ -148,21 +148,15 @@ El resto de variables:
 |---|---|
 | `CHAT_PORT` | puerto local (por defecto 8792) |
 | `CHAT_DATA` / `CHAT_STATIC` | rutas de datos y de estáticos |
-| `OMB_URL` | API local del agente (por defecto `http://127.0.0.1:8799`) |
-| `OMB_BOT_ID` / `OMB_THREAD_ID` | bot e hilo donde vive la conversación |
-| `VAPID_SUB` | contacto para las notificaciones push (`mailto:...`) |
-
-> **Nunca subas `.env` ni `data/` al repo.** El `.gitignore` ya los excluye.
-
-| Variable | Para qué |
-|---|---|
-| `CHAT_PORT` | puerto local (por defecto 8792) |
-| `CHAT_DATA` / `CHAT_STATIC` | rutas de datos y de estáticos |
+| `CHAT_BRAND` | marca que se muestra en la cabecera y en los textos |
+| `CHAT_PWA_NAME` | nombre de la PWA instalada (por defecto, el del manifiesto) |
 | `OMB_URL` | API local del agente (por defecto `http://127.0.0.1:8799`) |
 | `OMB_BOT_ID` / `OMB_THREAD_ID` | bot e hilo donde vive la conversación |
 | `CHAT_OWNER` | único email autorizado a entrar |
-| `MAIL_FROM_*`, `SMTP_HOST`, `SMTP_PORT` | envío del código de acceso |
-| `VAPID_SUB` | contacto para las notificaciones push |
+| `CHAT_MAIL_*` | remitente del código de acceso |
+| `SMTP_HOST` / `SMTP_PORT` | servidor SMTP de salida |
+| `VAPID_SUB` | contacto para las notificaciones push (`mailto:...`) |
+| `CHAT_DEBUG_KEEP` | cuántos mensajes conserva el botón "Depurar" |
 
 > **Nunca subas `.env` ni `data/` al repo.** El `.gitignore` ya los excluye.
 
@@ -173,13 +167,15 @@ El resto de variables:
 | `POST` | `/api/request-token` | envía el código de acceso al dueño |
 | `POST` | `/api/verify` | valida el código y crea la sesión |
 | `POST` | `/api/logout` | cierra la sesión |
-| `GET` | `/api/me` | ¿hay sesión válida? |
+| `GET` | `/api/me` | ¿hay sesión válida? (devuelve marca y email del dueño) |
 | `GET` | `/api/history` | historial de mensajes |
 | `POST` | `/api/send` | envía un mensaje y dispara el turno del agente |
 | `POST` | `/api/upload` | sube un adjunto |
 | `GET` | `/api/file/{id}` | descarga un adjunto (requiere sesión) |
 | `GET` | `/api/push/key` | clave pública VAPID |
 | `POST` | `/api/push/subscribe` | registra el dispositivo |
+| `POST` | `/api/push/prefs` | preferencia persistente de avisos (ON/OFF) |
+| `POST` | `/api/push/status` | ¿el servidor tiene esta suscripción? |
 | `POST` | `/api/push/test` | notificación de prueba |
 
 ## Seguridad

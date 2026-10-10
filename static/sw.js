@@ -1,4 +1,4 @@
-const CACHE = "chat-pwa-v20";
+const CACHE = "agent-chat-v1";
 const ASSETS = ["/", "/index.html", "/theme.css", "/app.js", "/icon.svg", "/icon-512.png", "/apple-touch-icon.png", "/manifest.webmanifest"];
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
@@ -6,6 +6,11 @@ self.addEventListener("install", (e) => {
 self.addEventListener("activate", (e) => {
   e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
 });
+// Latido de visibilidad enviado por la pagina. En iOS, al minimizar la PWA la
+// pagina se congela y su visibilityState se queda en "visible": por eso no basta
+// con leer el estado del cliente. Solo suprimimos la notificacion si la pagina
+// reporto estar visible hace muy poco (latido fresco). Si esta congelada, el
+// latido caduca y volvemos a notificar.
 let lastVisibleAt = 0;
 self.addEventListener("message", (e) => {
   const d = e.data || {};
@@ -15,7 +20,7 @@ self.addEventListener("message", (e) => {
 self.addEventListener("push", (e) => {
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: (e.data && e.data.text && e.data.text()) || "" }; }
-  const title = d.title || "Manager";
+  const title = d.title || "Agent Chat";
   const body = d.body || "Nuevo mensaje";
   e.waitUntil((async () => {
     // Si ya hay una ventana del chat visible, no notificamos: el usuario esta leyendo.
@@ -33,7 +38,7 @@ self.addEventListener("push", (e) => {
       icon: "/icon-512.png",
       badge: "/apple-touch-icon.png",
       vibrate: [120, 80, 120],
-      tag: "manager-msg",
+      tag: "agent-chat-msg",
       renotify: true,
       data: { url: "/" },
     });

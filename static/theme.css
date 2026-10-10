@@ -165,3 +165,11 @@ svg{display:block}
   max-width:90%;z-index:20;padding:9px 14px;border-radius:var(--radius-lg);font-size:13px;
   background:var(--color-ink);color:var(--color-app);box-shadow:0 4px 16px rgba(0,0,0,.18)}
 .toast.hidden{display:none!important}
+
+/* ---- Fix 3 (reversible): evita el auto-zoom de iOS al enfocar el compositor ----
+   iOS hace zoom al enfocar un input/textarea cuyo font-size es < 16px (aqui el body
+   baja a 15.5px en movil). Forzamos 16px SOLO cuando <html class="fix-zoom">.
+   Para revertir al comportamiento anterior: en app.js pon FIX_COMPOSER_ZOOM = false. */
+.fix-zoom textarea#text,
+.fix-zoom input,
+.fix-zoom select{font-size:16px}
