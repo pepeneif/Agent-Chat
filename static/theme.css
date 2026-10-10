@@ -76,14 +76,16 @@ main#scroll{flex:1;overflow-y:auto;padding:12px 10px;scroll-behavior:smooth}
   display:inline-flex;align-items:center;gap:6px;margin-top:6px;padding:6px 10px;
   border:1px solid var(--color-hairline);border-radius:var(--radius-lg);
   background:var(--color-inset);color:var(--color-accent-text);text-decoration:none;font-size:13px}
-.typing{font-size:12px;line-height:16px;color:var(--color-ink-secondary);padding:3px 16px 8px;min-height:16px;
-  display:flex;align-items:center;gap:8px}
-#typingText{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-/* Flechita "ir al final": pega a la derecha del indicador, con los colores de la burbuja del usuario. */
-button.jump{flex:0 0 auto;width:30px;height:30px;padding:0;border-radius:50%;cursor:pointer;
-  display:grid;place-items:center;
+.typing{font-size:12px;line-height:16px;color:var(--color-ink-secondary);padding:3px 16px 8px;min-height:16px}
+#typingText{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Flechita "ir al final": flota justo encima del compositor, a la derecha (la misma banda
+   donde aparece "Manager esta trabajando..."), con los colores de la burbuja del usuario.
+   Va DENTRO del footer a proposito: asi NO la oculta el indicador cuando el chat esta en reposo. */
+button.jump{position:absolute;top:-38px;right:14px;width:30px;height:30px;padding:0;
+  border-radius:50%;cursor:pointer;display:grid;place-items:center;z-index:6;
   background:var(--color-bubble-user);color:var(--color-bubble-user-ink);
-  border:1px solid var(--color-accent-border)}
+  border:1px solid var(--color-accent-border);
+  box-shadow:0 1px 6px rgba(0,0,0,.10)}
 button.jump:active{background:var(--color-raised-hover)}
 button.jump.hidden{display:none!important}
 button.jump svg{display:block}
