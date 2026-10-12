@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- fondo Atelier (opaque, iOS lo recorta) -->
+  <rect width="512" height="512" fill="#f5f1eb"/>
+  <!-- antena -->
+  <rect x="249" y="86" width="14" height="44" rx="7" fill="#a05f25"/>
+  <circle cx="256" cy="74" r="22" fill="#a05f25"/>
+  <!-- orejas -->
+  <rect x="76" y="238" width="34" height="86" rx="17" fill="#a05f25"/>
+  <rect x="402" y="238" width="34" height="86" rx="17" fill="#a05f25"/>
+  <!-- cabeza -->
+  <rect x="112" y="126" width="288" height="272" rx="72" fill="#a05f25"/>
+  <!-- visor -->
+  <rect x="150" y="196" width="212" height="130" rx="40" fill="#fbf8f2"/>
+  <!-- ojos -->
+  <circle cx="206" cy="261" r="27" fill="#a05f25"/>
+  <circle cx="306" cy="261" r="27" fill="#a05f25"/>
+  <!-- boca -->
+  <path d="M206 372h100" stroke="#a05f25" stroke-width="18" stroke-linecap="round" fill="none"/>
+</svg>
