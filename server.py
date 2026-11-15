@@ -43,6 +43,11 @@ SESSION_DAYS = 30
 TOKEN_MIN    = 15
 MAX_UPLOAD   = 25 * 1024 * 1024
 
+# Tope global de generacion de codigos, independiente del limite por IP. Evita
+# inundar el buzon del dueno con IPs rotativas. Configurable con la variable de
+# entorno CHAT_TOKEN_LIMIT_PER_HOUR; el valor sin configurar es deliberadamente bajo.
+TOKEN_GEN_LIMIT_PER_HOUR = int(os.environ.get("CHAT_TOKEN_LIMIT_PER_HOUR", "10"))
+
 # Opcion B: una sola burbuja "en curso" por turno de Manager, actualizada en silencio
 # durante el turno, con un push al nacer y otro forzado al cerrar. Desactivada por
 # defecto para no alterar la via A (mirror actual); se activa con CHAT_OPTION_B=1.
@@ -435,6 +440,15 @@ def log_line(msg):
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
     except Exception:
         pass
+
+# F1 (S-2026-11-15): aislar SMTP para que /api/request-token responda con el mismo
+# coste tanto si el email coincide como si no. El fallo SMTP se registra en mail.log
+# y NUNCA se devuelve como 502 al cliente.
+def _send_token_safely(to_addr, token):
+    try:
+        send_token_email(to_addr, token)
+    except Exception as e:
+        log_line(f"MAIL FALLO {e} to={to_addr}")
 
 # ---------- OMB ----------
 def omb_get(path):
@@ -1710,19 +1724,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(429, {"error": "too many requests"})
         body = json.loads(self._body().decode("utf-8") or "{}")
         email = (body.get("email") or "").strip()
+        # F1 (S-2026-11-15, segunda vuelta): el camino de la peticion es identico
+        # para un email que coincide y uno que no, por construccion. Toda la logica
+        # especifica del dueno se mueve a un hilo daemon; no hay comparacion de email,
+        # comprobacion del tope global ni escritura en logins en el camino HTTP. La
+        # respuesta se escribe antes de lanzar el hilo para que ni siquiera el arranque
+        # o la primera ejecucion del trabajo asincrono pueda contaminar la latencia.
+        self._json(200, {"ok": True})
+        threading.Thread(target=self._issue_token_if_owner, args=(email,), daemon=True).start()
+
+    def _issue_token_if_owner(self, email):
         if email.lower() != OWNER:
-            time.sleep(1.0)
-            return self._json(200, {"ok": True})
+            return
+        # F2 (S-2026-11-15): el tope global se comprueba dentro del hilo, antes de
+        # generar o insertar el token. Si esta agotado ya no hay canal de respuesta:
+        # solo se deja constancia en mail.log y el HTTP ya habia devuelto 200.
+        if not self._rate_ok("token_gen_global", TOKEN_GEN_LIMIT_PER_HOUR, 3600):
+            log_line("TOKEN LIMITE GLOBAL alcanzado, no se genero token")
+            return
         tok = secrets.token_urlsafe(18)
         with _dblock, db() as c:
             c.execute("INSERT INTO logins(token,created,expires,used) VALUES(?,?,?,0)",
                       (tok, int(time.time()), int(time.time()) + TOKEN_MIN * 60))
-        try:
-            send_token_email(OWNER, tok)
-        except Exception as e:
-            traceback.print_exc()
-            return self._json(502, {"error": "mail failed"})
-        return self._json(200, {"ok": True})
+        # El envio SMTP es asincrono y los fallos quedan en mail.log mediante
+        # _send_token_safely; nunca forman parte de la respuesta HTTP.
+        _send_token_safely(OWNER, tok)
 
     def _verify(self):
         ip = self._client_ip()
