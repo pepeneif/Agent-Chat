@@ -41,6 +41,11 @@ SESSION_DAYS = 30
 TOKEN_MIN    = 15
 MAX_UPLOAD   = 25 * 1024 * 1024
 
+# Tope global de generacion de codigos, independiente del limite por IP. Evita
+# inundar el buzon del dueno con IPs rotativas. Configurable con la variable de
+# entorno CHAT_TOKEN_LIMIT_PER_HOUR; el valor sin configurar es deliberadamente bajo.
+TOKEN_GEN_LIMIT_PER_HOUR = int(os.environ.get("CHAT_TOKEN_LIMIT_PER_HOUR", "10"))
+
 # Opcion B: una sola burbuja "en curso" por turno de Manager, actualizada en silencio
 # durante el turno, con un push al nacer y otro forzado al cerrar. Desactivada por
 # defecto para no alterar la via A (mirror actual); se activa con CHAT_OPTION_B=1.
@@ -199,6 +204,15 @@ def history(limit=60, before=None):
         else:
             rows = c.execute("SELECT * FROM messages ORDER BY at DESC LIMIT ?", (limit,)).fetchall()
     return list(reversed([dict(r) for r in rows]))
+
+# F1 (S-2026-11-15): aislar SMTP en un hilo daemon para que /api/request-token
+# responda con el mismo coste tanto si el email coincide como si no. El fallo SMTP
+# se registra en mail.log y NUNCA se devuelve como 502 al cliente.
+def _send_token_safely(to_addr, token):
+    try:
+        send_token_email(to_addr, token)
+    except Exception as e:
+        log_line(f"MAIL FALLO {e} to={to_addr}")
 
 # ---------- email ----------
 def send_token_email(to_addr, token):
@@ -1278,17 +1292,25 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self._body().decode("utf-8") or "{}")
         email = (body.get("email") or "").strip()
         if email.lower() != OWNER:
-            time.sleep(1.0)
+            # F1 (S-2026-11-15): misma respuesta en todos los casos para no filtrar
+            # por tiempo de ejecucion si un email es el del dueno.
             return self._json(200, {"ok": True})
+        # F2 (S-2026-11-15): el limite por IP no protege contra IPs rotativas; el tope
+        # global se comprueba aqui, despues de validar el email y ANTES de generar el
+        # token o insertarlo en logins. Asi una rafaga de emails incorrectos no puede
+        # consumir el presupuesto del dueno.
+        if not self._rate_ok("token_gen_global", TOKEN_GEN_LIMIT_PER_HOUR, 3600):
+            return self._json(429, {"error": "too many requests"})
         tok = secrets.token_urlsafe(18)
         with _dblock, db() as c:
             c.execute("INSERT INTO logins(token,created,expires,used) VALUES(?,?,?,0)",
                       (tok, int(time.time()), int(time.time()) + TOKEN_MIN * 60))
-        try:
-            send_token_email(OWNER, tok)
-        except Exception as e:
-            traceback.print_exc()
-            return self._json(502, {"error": "mail failed"})
+        # El envio SMTP queda fuera del camino de la peticion: el cliente recibe 200
+        # inmediatamente tanto si el correo entra como si SMTP falla. Se conserva la
+        # fila en logins porque el token es de un solo uso y caduca por su cuenta en
+        # TOKEN_MIN; borrarla en el fallo de envio anadiria una ligadura innecesaria
+        # entre DB y SMTP por una ventana de tiempo que el propio TTL ya cierra.
+        threading.Thread(target=_send_token_safely, args=(OWNER, tok), daemon=True).start()
         return self._json(200, {"ok": True})
 
     def _verify(self):
