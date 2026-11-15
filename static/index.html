@@ -39,13 +39,28 @@
 
   <!-- CHAT -->
   <header class="top hidden" id="topBar">
-    <span class="dot"></span>
-    <span class="brand">Manager</span>
+    <span class="dot" id="statusDot" role="button" tabindex="0" aria-label="Avisos" title="Avisos"></span>
+    <span class="brand">Chat</span>
     <span class="spacer"></span>
-    <button class="ghost" id="btnNotify" title="Avisos">Avisos</button>
+    <button class="ghost" id="btnSearch" title="Buscar en el chat y la wiki" aria-expanded="false">Busca</button>
     <button class="ghost" id="btnDebug" title="Depurar el chat">Depurar</button>
     <button class="ghost" id="btnLogout" title="Salir">Salir</button>
   </header>
+
+  <div id="searchPanel" class="searchpanel hidden" role="search">
+    <div class="srow">
+      <input id="searchInput" type="search" inputmode="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Buscar (2+ letras)...">
+      <span id="searchCount" class="scount"></span>
+      <button class="sarrow" id="btnPrev" title="Ocurrencia anterior" aria-label="Anterior">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 15l-6-6-6 6"/></svg>
+      </button>
+      <button class="sarrow" id="btnNext" title="Ocurrencia siguiente" aria-label="Siguiente">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+    </div>
+    <label class="swiki"><input type="checkbox" id="searchWiki" checked> Buscar tambien en la wiki (memoria del bot)</label>
+    <div id="searchWikiHits" class="swikihits hidden"></div>
+  </div>
 
   <div id="pushBanner" class="pushbanner hidden">
     <span>Activa los avisos para que te suene el movil cuando te escriba.</span>
@@ -53,7 +68,7 @@
   </div>
 
   <main id="scroll" class="hidden"></main>
-  <div class="typing hidden" id="typing"><span id="typingText">Manager esta trabajando...</span></div>
+  <div class="typing hidden" id="typing"><span id="typingText">En curso...</span></div>
   <div class="toast hidden" id="toast"></div>
 
   <footer class="composer hidden" id="composer">

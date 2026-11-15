@@ -163,8 +163,12 @@ El resto de variables:
 | `CHAT_DATA` / `CHAT_STATIC` | rutas de datos y de estáticos |
 | `CHAT_BRAND` | marca que se muestra en la cabecera y en los textos |
 | `CHAT_PWA_NAME` | nombre de la PWA instalada (por defecto, el del manifiesto) |
-| `OMB_URL` | API local del agente (por defecto `http://127.0.0.1:8799`) |
-| `OMB_BOT_ID` / `OMB_THREAD_ID` | bot e hilo donde vive la conversación |
+| `CHAT_OMB` | API local del agente (por defecto `http://127.0.0.1:8799`) |
+| `CHAT_BOT_ID` / `CHAT_THREAD_ID` | bot e hilo donde vive la conversación |
+| `CHAT_SEARCH` / `CHAT_SEARCH_MIN` | búsqueda en historial y wiki; letras mínimas |
+| `CHAT_OMB_CONTAINER` | contenedor de OMB para leer adjuntos no-imagen |
+| `CHAT_WIKI_CONTAINER` / `CHAT_WIKI_WORKSPACE` / `CHAT_WIKI_DIRS` | wiki en solo lectura desde el volumen de OMB |
+| `CHAT_TOKEN_LIMIT_PER_HOUR` | tope global de códigos por hora (por defecto 10) |
 | `CHAT_OWNER` | único email autorizado a entrar |
 | `CHAT_MAIL_*` | remitente del código de acceso |
 | `SMTP_HOST` / `SMTP_PORT` | servidor SMTP de salida |

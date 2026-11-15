@@ -1,7 +1,9 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
-const state = { pending: [], lastAt: 0, timer: null, sending: false, awaitOwn: false, turnControl: false, tmp: [] };
+const state = { pending: [], lastAt: 0, timer: null, sending: false, awaitOwn: false, turnControl: false, tmp: [], search: null };
 let OWNER_EMAIL = "";
+// Marca del despliegue: se sustituye con /api/me (CHAT_BRAND) al arrancar.
+let BRAND = "Chat";
 // Fix 3 (zoom al escribir) REVERSIBLE: para volver al comportamiento anterior, cambia a false.
 const FIX_COMPOSER_ZOOM = true;
 const FIX_ZOOM = FIX_COMPOSER_ZOOM;   // alias
@@ -9,7 +11,20 @@ if (FIX_COMPOSER_ZOOM) document.documentElement.classList.add("fix-zoom");
 else document.documentElement.classList.add("no-fix-zoom");
 
 async function api(path, opts) {
-  const r = await fetch(path, Object.assign({ credentials: "same-origin" }, opts || {}));
+  // Timeout: si el movil pierde la red, la peticion no puede quedar colgada para siempre
+  // (antes el compositor se quedaba lleno indefinidamente).
+  const o = Object.assign({ credentials: "same-origin" }, opts || {});
+  if (!o.signal && typeof AbortController !== "undefined") {
+    const ctrl = new AbortController();
+    o.signal = ctrl.signal;
+    setTimeout(() => ctrl.abort(), 25000);
+  }
+  let r;
+  try {
+    r = await fetch(path, o);
+  } catch (e) {
+    return { ok: false, status: 0, data: null, error: String(e && e.message || e) };
+  }
   let j = null;
   try { j = await r.json(); } catch (e) { j = null; }
   return { ok: r.ok, status: r.status, data: j };
@@ -179,7 +194,6 @@ function linkify(text) {
     out.push("<p>" + mdInline(para.join("\n")).replace(/\n/g, "<br>") + "</p>");
   }
   let html = out.join("\n");
-  html = html.replace(/(\/api\/file\/[0-9a-f]{32})/g, (m) => `<a class="file" href="${m}" target="_blank" rel="noopener">abrir adjunto</a>`);
   return html;
 }
 function render(m) {
@@ -187,17 +201,30 @@ function render(m) {
   wrap.className = "msg " + (m.role === "user" ? "user" : m.role === "system" ? "system" : "bot");
   wrap.dataset.id = m.id || "";
   if (m.role === "bot" && m.live) wrap.classList.add("live");
-  const who = m.role === "user" ? "Tu" : m.role === "bot" ? "Manager" : "";
+  const who = m.role === "user" ? "Tu" : m.role === "bot" ? BRAND : "";
   let inner = "";
   if (m.role !== "system") inner += `<div class="who">${who} · ${fmtTime(m.at)}</div>`;
-  let body = linkify(m.content);
-  wrap.innerHTML = `<div><div>${inner}</div><div class="bubble">${body}</div></div>`;
-  // imagenes: si hay un adjunto imagen, mostrarlo inline
+  // Adjuntos: las URLs /api/file/<hex> no se pintan como texto ni como enlace "abrir"
+  // (no habia forma de cerrar el visor). Las IMAGENES se muestran inline; el resto se
+  // ofrece como boton "Descargar" (el backend las sirve con Content-Disposition attachment,
+  // asi que bajan a Archivos del telefono). Peticion de Jose, 2026-10-19.
   const ids = (m.content.match(/\/api\/file\/[0-9a-f]{32}/g) || []);
+  let text = m.content;
+  ids.forEach((u) => { text = text.replace(u, ""); });
+  let body = linkify(text);
+  wrap.innerHTML = `<div><div>${inner}</div><div class="bubble">${body}</div></div>`;
+  const bubble = wrap.querySelector(".bubble");
   ids.forEach((u) => {
     const img = new Image();
     img.src = u; img.alt = "adjunto";
-    img.onload = () => { wrap.querySelector(".bubble").appendChild(img); if (_stickBottom) { scrollDown(); } };
+    img.onload = () => { bubble.appendChild(img); if (_stickBottom) { scrollDown(); } };
+    img.onerror = () => {
+      if (bubble.querySelector('a.file[href="' + u + '"]')) return;
+      const a = document.createElement("a");
+      a.className = "file"; a.href = u;
+      a.setAttribute("download", ""); a.textContent = "Descargar";
+      bubble.appendChild(a); if (_stickBottom) { scrollDown(); }
+    };
   });
   return wrap;
 }
@@ -296,9 +323,9 @@ function newTmpId() {
   }
   return "tmp-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
-function addTmp(text) {
+function addTmp(text, at) {
   const id = newTmpId();
-  const el = upsert({ id: id, role: "user", content: text, at: 0 });
+  const el = upsert({ id: id, role: "user", content: text, at: at || Date.now() });
   el.classList.add("tmp");
   state.tmp.push({ id: id, text: _tmpFp(text) });
   return el;
@@ -314,7 +341,10 @@ function upsert(m) {
   let existing = (m.id && $("scroll").querySelector(`[data-id="${CSS.escape(m.id)}"]`)) || null;
   if (!existing && m.role === "user") {
     const fp = _tmpFp(m.content);
-    const idx = state.tmp.findIndex((r) => r.text === fp);
+    // Con adjuntos el servidor concatena "texto\n[adjunto] ...": la huella no es igual,
+    // asi que tambien emparejamos si el mensaje empieza por la huella de la burbuja.
+    const idx = state.tmp.findIndex((r) => r.text === fp || (r.text && fp.startsWith(r.text)));
+
     if (idx >= 0) {
       const row = state.tmp[idx];
       state.tmp.splice(idx, 1);
@@ -351,13 +381,66 @@ async function loadHistory() {
   pinBottom();                       // y lo reafirmamos tras el layout (imagenes/markdown)
   setTimeout(() => { const s2 = $("scroll"); if (s2 && _stickBottom) _forceBottom(s2); _updJump(); }, 300);
   _updJump();
+  if (state.search && state.search.active && !hasTextSelection()) applySearchMarks();
+}
+
+// Carga hacia ATRAS (mensajes mas antiguos) y los PREPONE arriba, conservando la
+// posicion visual. Sirve al buscador para alcanzar coincidencias fuera de la ventana
+// de 80 mensajes ya cargada, sin romper el orden cronologico del DOM.
+async function loadOlder(limit) {
+  const s = $("scroll");
+  if (!s) return 0;
+  const first = s.querySelector(".msg[data-at]");
+  const before = first ? Number(first.dataset.at) : (state.lastAt || Date.now());
+  if (!before) return 0;
+  const r = await api("/api/history?limit=" + (limit || 120) + "&before=" + encodeURIComponent(before));
+  if (!r.ok || !r.data || !(r.data.messages || []).length) return 0;
+  const prevH = s.scrollHeight, prevTop = s.scrollTop;
+  const frag = document.createDocumentFragment();
+  let n = 0;
+  r.data.messages.forEach((m) => {
+    if (m.id && s.querySelector('[data-id="' + CSS.escape(m.id) + '"]')) return;
+    const el = render(m);
+    el.dataset.at = String(m.at || 0);
+    frag.appendChild(el); n++;
+  });
+  if (n) {
+    s.insertBefore(frag, s.firstChild);
+    s.scrollTop = prevTop + (s.scrollHeight - prevH);   // mantener lo que se veia
+  }
+  return n;
 }
 
 /* ---------------- polling ---------------- */
+let _failStreak = 0;   // polls fallidos seguidos (red / cancelacion HTTP/3 en movil)
+let _tickBusy = false; // evita apilar polls: si la red se atasca, no se encolan decenas
 async function tick() {
+  if (_tickBusy) return;              // ya hay un poll en vuelo; no encolar mas
+  _tickBusy = true;
+  try {
+    await _tickOnce();
+  } finally {
+    _tickBusy = false;
+  }
+}
+async function _tickOnce() {
   reportView(false);
-  const r = await api("/api/history?limit=40");
+  // Poll incremental: pedir SOLO lo nuevo (after=lastAt). Antes bajaba 40 mensajes
+  // completos (~65 KB) cada 700 ms; en el movil eso saturaba el enlace y HTTP/3
+  // cancelaba la respuesta (chat "congelado"). El primer poll (lastAt=0) trae el lote.
+  const url = state.lastAt > 0
+    ? "/api/history?limit=40&after=" + encodeURIComponent(state.lastAt)
+    : "/api/history?limit=40";
+  const r = await api(url);
   if (r.status === 401) { stopPolling(); showLogin(); return; }
+  if (!r.ok || !r.data) {
+    // El poll se cayo (p. ej. HTTP/3 cancela la respuesta en el movil). Antes esto
+    // dejaba el chat "congelado" hasta cerrar y reabrir la PWA; ahora se auto-recupera
+    // recargando el historial en cuanto se acumulan fallos seguidos.
+    if (++_failStreak >= 4) { _failStreak = 0; try { await loadHistory(); } catch (e) {} }
+    return;
+  }
+  _failStreak = 0;
   if (r.data && typeof r.data.busy === "boolean") setTyping(r.data.busy, r.data.busySince, r.data.waitingBots);
   const msgs = (r.data.messages || []).filter((m) => m.at > state.lastAt);
   const hadBot = msgs.some((m) => m.role === "bot" || m.role === "system");
@@ -379,6 +462,7 @@ async function tick() {
   }
   if (hadBot) { state.sending = false; $("btnSend").disabled = false; }
   _updJump();
+  if (state.search && state.search.active && msgs.length && !hasTextSelection()) applySearchMarks();
 }
 function startPolling() { stopPolling(); state.timer = setInterval(tick, 700); tick(); }
 function stopPolling() { if (state.timer) clearInterval(state.timer); state.timer = null; }
@@ -438,7 +522,7 @@ function setTyping(on, sinceMs, waitingBots) {
     const peers = (waitingBots.peers && waitingBots.peers.length)
       ? " " + waitingBots.peers.join(", ")
       : "";
-    text = "Manager, está esperando a" + peers +
+    text = BRAND + ", está esperando a" + peers +
            " (" + waitSecs + "s)";
   } else {
     _waitingAnchor = 0;
@@ -446,8 +530,8 @@ function setTyping(on, sinceMs, waitingBots) {
     // y seguimos contando cada tick. Un sinceMs valido (marca real del turno) reancla.
     const secs = typingSeconds(Date.now(), sinceMs);
     text = secs > 3
-      ? "Manager esta trabajando... (" + secs + "s)"
-      : "Manager esta trabajando...";
+      ? BRAND + " esta trabajando... (" + secs + "s)"
+      : BRAND + " esta trabajando...";
   }
   tx.textContent = text;
   el.classList.remove("hidden");
@@ -487,20 +571,28 @@ async function send() {
   if (!t.trim() && !atts.length) return;
   state.sending = true;
   $("btnSend").disabled = true;
-  const tmpEl = t.trim() ? addTmp(t) : null;
+  // Eco optimista INMEDIATO: la burbuja aparece con la hora local correcta (antes at:0
+  // mostraba "1 ene 07:30" en Asia/Singapore hasta que llegaba el mensaje real).
+  const tmpEl = t.trim() ? addTmp(t, Date.now()) : null;
   if (tmpEl && _stickBottom) scrollDown(true);
+  // Limpiamos el campo YA, sin esperar al servidor: en movil el ida-y-vuelta tardaba
+  // segundos y parecia que el chat se habia caido.
+  $("text").value = ""; autosize();
+  state.pending = []; $("attachrow").innerHTML = "";
+  state.awaitOwn = true;       // al llegar, mi mensaje queda pegado abajo
+  state.sending = false;       // F3: el compositor NUNCA se bloquea
+  $("btnSend").disabled = false;
   const r = await api("/api/send", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ text: t, attachments: atts })
   });
-  if (!r.ok) { dropTmp(tmpEl); state.sending = false; $("btnSend").disabled = false; alert("No se pudo enviar."); return; }
-  $("text").value = ""; autosize();
-  state.pending = []; $("attachrow").innerHTML = "";
-  state.awaitOwn = true;       // al llegar, mi mensaje queda pegado abajo
-  // F3: el compositor NUNCA se bloquea. Re-habilitamos en cuanto /api/send responde ok,
-  // sin esperar que entre un mensaje bot/system por poll (que iOS puede congelar).
-  state.sending = false;
-  $("btnSend").disabled = false;
+  if (!r.ok) {
+    // Fallo real de red/servidor: devolvemos el texto al campo y quitamos la burbuja.
+    dropTmp(tmpEl);
+    $("text").value = t; autosize();
+    alert("No se pudo enviar.");
+    return;
+  }
   setTyping(true);
   setTimeout(tick, 300);
 }
@@ -580,15 +672,22 @@ async function enablePush(btn) {
     alert("Error activando avisos: " + e.message);
   }
 }
-function setNotifyBtn(btn, state) {
-  if (!btn) return;
-  btn.classList.remove("on", "off");
-  if (state === "on") { btn.textContent = "Avisos ON"; btn.classList.add("on"); }
-  else if (state === "off") { btn.textContent = "Avisos OFF"; btn.classList.add("off"); }
-  else if (state === "blocked") btn.textContent = "Avisos bloqueado";
-  else if (state === "unsupported") btn.textContent = "Avisos n/d";
-  else if (state === "error") btn.textContent = "Avisos error";
-  else btn.textContent = "Avisos";
+// El antiguo boton "Avisos" pasa a ser el PUNTO de la cabecera: verde = avisos
+// activos, rojo = no. Sigue llamandose setNotifyBtn para no tocar los llamadores.
+function setNotifyBtn(dot, state) {
+  if (!dot) return;
+  dot.classList.remove("on", "off");
+  const label = {
+    "on": "Avisos activos (toca para desactivar)",
+    "off": "Avisos desactivados (toca para activar)",
+    "blocked": "Avisos bloqueados en el sistema",
+    "unsupported": "Avisos no disponibles en este navegador",
+    "error": "Error consultando los avisos",
+    "plain": "Activa los avisos",
+  }[state] || "Avisos";
+  if (state === "on") dot.classList.add("on"); else dot.classList.add("off");
+  dot.title = label;
+  dot.setAttribute("aria-label", label);
 }
 function startHeartbeat(reg) {
   const send = () => {
@@ -694,6 +793,262 @@ async function debugChat() {
   }, 3000);
 }
 
+/* ---------------- busqueda (2026-10-15) ---------------- */
+// Busca en el historial del chat (lo no depurado) y, opcionalmente, en la wiki de
+// memoria del bot. El marcado se hace sobre los nodos de texto ya renderizados, asi
+// que respeta el formato (negritas, codigo, tablas) sin re-parsear nada.
+const SEARCH_MIN = 2;
+let _searchTimer = null;
+
+// Hay una seleccion de texto viva dentro del chat o del panel de wiki? Si la hay,
+// NO reescribimos los <mark> (applySearchMarks destruye la seleccion en curso): se
+// pospone el repintado para no arrancarle a Jose lo que acaba de seleccionar.
+function hasTextSelection() {
+  try {
+    const sel = (window.getSelection && window.getSelection()) || null;
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    const node = sel.anchorNode;
+    if (!node) return false;
+    const el = node.nodeType === 1 ? node : node.parentElement;
+    if (!el) return false;
+    const sc = $("scroll"), wp = $("searchWikiHits");
+    return (sc && sc.contains(el)) || (wp && wp.contains(el));
+  } catch (e) { return false; }
+}
+
+function foldStr(str) {
+  let out = "";
+  for (const ch of String(str || "")) {
+    let d;
+    try { d = ch.normalize("NFD").replace(/[\u0300-\u036f]/g, ""); } catch (e) { d = ch; }
+    let f;
+    if (d.length === 1) f = d.toLowerCase();
+    else f = ch.length === 1 ? ch.toLowerCase() : ch;
+    if (f.length !== 1) f = ch;   // conservar longitud 1:1 (alineacion de indices)
+    out += f;
+  }
+  return out;
+}
+function occIn(hay, needle) {
+  const out = [];
+  if (!needle) return out;
+  let i = 0;
+  while (true) {
+    const k = hay.indexOf(needle, i);
+    if (k < 0) break;
+    out.push(k);
+    i = k + needle.length;
+  }
+  return out;
+}
+function clearSearchMarks() {
+  // Solo quitamos NUESTRAS marcas (data-smark): un <mark> que venga del markdown del
+  // mensaje no es nuestro y no se debe destruir (H3 auditoria 2026-10-15).
+  document.querySelectorAll(".msg .bubble mark[data-smark]").forEach((mk) => {
+    const t = document.createTextNode(mk.textContent);
+    mk.parentNode.replaceChild(t, mk);
+  });
+  document.querySelectorAll(".msg[data-hit]").forEach((m) => m.removeAttribute("data-hit"));
+}
+function bubbleTextNodes(el) {
+  const nodes = [];
+  const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+  let n;
+  while ((n = w.nextNode())) nodes.push(n);
+  return nodes;
+}
+// Marca las ocurrencias de la consulta en los mensajes ya cargados. Devuelve la lista
+// plana de <mark> en orden de aparicion.
+function applySearchMarks() {
+  const t = state.search;
+  const nq0 = (t && t.active && t.q) ? foldStr(t.q) : "";
+  if (!nq0) { if (!hasTextSelection()) clearSearchMarks(); return []; }
+  // Si hay una seleccion viva Y las marcas ya corresponden a ESTA consulta, no repintamos
+  // (no arrancarle a Jose la seleccion). Pero si la consulta CAMBIO, si repintamos: dejar
+  // la marca del termino viejo seria peor (marca y contador desincronizados).
+  if (hasTextSelection() && t._appliedQ === t.q && (t._marks || []).length) return t._marks;
+  clearSearchMarks();
+  const nq = nq0;
+  const ids = new Set((t.hits || []).map((h) => h.id));
+  const marks = [];
+  document.querySelectorAll(".msg[data-id]").forEach((msg) => {
+    if (!ids.has(msg.dataset.id)) return;
+    const bubble = msg.querySelector(".bubble");
+    if (!bubble) return;
+    msg.setAttribute("data-hit", "1");
+    bubbleTextNodes(bubble).forEach((node) => {
+      const txt = node.nodeValue || "";
+      const folded = foldStr(txt);
+      const occ = occIn(folded, nq);
+      if (!occ.length) return;
+      const frag = document.createDocumentFragment();
+      let last = 0;
+      occ.forEach((pos) => {
+        if (pos > last) frag.appendChild(document.createTextNode(txt.slice(last, pos)));
+        const mk = document.createElement("mark");
+        mk.setAttribute("data-smark", "1");
+        mk.textContent = txt.slice(pos, pos + nq.length);
+        frag.appendChild(mk); marks.push(mk);
+        last = pos + nq.length;
+      });
+      if (last < txt.length) frag.appendChild(document.createTextNode(txt.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    });
+  });
+  t._marks = marks;
+  t._appliedQ = t.q;
+  return marks;
+}
+function searchTotal() {
+  const t = state.search; if (!t) return 0;
+  return (t.hits || []).reduce((a, h) => a + (h.count || 0), 0);
+}
+function setSearchCount() {
+  const t = state.search; if (!t) return;
+  const el = $("searchCount"); if (!el) return;
+  if (!t.q || !t.active) { el.innerHTML = ""; return; }
+  // Dos renglones para dejar el maximo ancho al campo: arriba las ocurrencias en los
+  // mensajes (posicion actual de total), abajo las de la wiki (solo si se busca ahi).
+  const total = searchTotal();
+  const wc = wikiCount();
+  const showWiki = !!(t.wiki && t.wiki.length);
+  const msgLine = total ? ((t.i + 1) + " de " + total)
+                        : (showWiki ? "0 mensajes" : "sin result.");
+  let h = "<span class=\"cl ms\">" + esc(msgLine) + "</span>";
+  if (showWiki) h += "<span class=\"cl wk\">wiki " + esc(String(wc)) + "</span>";
+  el.innerHTML = h;
+}
+function wikiCount() {
+  const t = state.search;
+  return (t.wiki || []).reduce((a, h) => a + (h.count || 0), 0);
+}
+function renderWikiHits() {
+  const box = $("searchWikiHits"); if (!box) return;
+  const t = state.search;
+  const hits = (t && t.wiki) || [];
+  if (!hits.length) { box.classList.add("hidden"); box.innerHTML = ""; return; }
+  let h = "";
+  hits.slice(0, 12).forEach((f) => {
+    const line = (f.hits && f.hits[0]) ? f.hits[0].text : "";
+    h += "<div class=\"wh\"><b>" + esc(f.path) + "</b> (" + f.count + ")" +
+         (line ? "<br>" + esc(line) : "") + "</div>";
+  });
+  box.innerHTML = h;
+  box.classList.remove("hidden");
+}
+// Asegura que el mensaje `id` este en el DOM (cargando hacia atras si hace falta).
+async function ensureMessage(id) {
+  const s = $("scroll");
+  if (!s) return false;
+  if (s.querySelector('[data-id="' + CSS.escape(id) + '"]')) return true;
+  for (let k = 0; k < 40; k++) {           // tope: no encadenar cargas sin fin
+    const n = await loadOlder(150);
+    if (!n) return false;
+    if (s.querySelector('[data-id="' + CSS.escape(id) + '"]')) return true;
+  }
+  return false;
+}
+async function gotoCurrent() {
+  const t = state.search;
+  if (!t || !t.active || !t.hits || !t.hits.length) { applySearchMarks(); setSearchCount(); return; }
+  t.i = Math.max(0, Math.min(t.i, t.hits.length - 1));
+  const hit = t.hits[t.i];
+  t.occ = Math.max(0, Math.min(t.occ || 0, (hit.count || 1) - 1));
+  await ensureMessage(hit.id);
+  const marks = applySearchMarks();
+  // Indice plano de la ocurrencia buscada = ocurrencias de todos los mensajes previos + occ
+  let flat = t.occ;
+  for (let k = 0; k < t.i; k++) flat += (t.hits[k].count || 0);
+  marks.forEach((mk, i) => mk.classList.toggle("cur", i === flat));
+  const cur = marks[flat];
+  const el = cur ? cur.closest(".msg") : null;
+  if (el) { _stickBottom = false; revealMessage(el); }
+  else if (hit.id) {
+    const msg = $("scroll").querySelector('[data-id="' + CSS.escape(hit.id) + '"]');
+    if (msg) { _stickBottom = false; revealMessage(msg); }
+  }
+  setSearchCount();
+}
+function searchStep(delta) {
+  const t = state.search;
+  if (!t || !t.hits || !t.hits.length) return;
+  const total = searchTotal();
+  let flat = 0;
+  for (let k = 0; k < t.i; k++) flat += (t.hits[k].count || 0);
+  flat += (t.occ || 0) + delta;
+  if (flat < 0) flat = total - 1;
+  if (flat >= total) flat = 0;
+  // traducir flat -> (i, occ)
+  let acc = 0;
+  for (let k = 0; k < t.hits.length; k++) {
+    const c = t.hits[k].count || 0;
+    if (flat < acc + c) { t.i = k; t.occ = flat - acc; break; }
+    acc += c;
+  }
+  gotoCurrent();
+}
+async function runSearch(q) {
+  const t = state.search = state.search || { active: false, hits: [], wiki: [], i: 0, occ: 0 };
+  t.q = q;
+  if (!q || q.length < SEARCH_MIN) {
+    t.active = false; t.hits = []; t.wiki = []; t.i = 0; t.occ = 0;
+    clearSearchMarks(); renderWikiHits(); setSearchCount();
+    return;
+  }
+  t.active = true;
+  let url = "/api/search?q=" + encodeURIComponent(q);
+  if ($("searchWiki") && $("searchWiki").checked) url += "&wiki=1";
+  const r = await api(url);
+  if (!r.ok || !r.data) { t.hits = []; t.wiki = []; clearSearchMarks(); setSearchCount(); return; }
+  if (r.data.q !== t.q) return;             // respuesta obsoleta
+  t.hits = r.data.chat || [];
+  t.wiki = r.data.wiki || [];
+  t.i = 0; t.occ = 0;
+  renderWikiHits();
+  await gotoCurrent();
+}
+function openSearch() {
+  const p = $("searchPanel");
+  if (!p) return;
+  p.classList.remove("hidden");
+  const b = $("btnSearch"); if (b) b.setAttribute("aria-expanded", "true");
+  const inp = $("searchInput");
+  if (inp) { inp.focus(); inp.select(); }
+  try { p.scrollIntoView({ block: "nearest" }); } catch (e) {}
+}
+function closeSearch() {
+  const p = $("searchPanel");
+  if (p) p.classList.add("hidden");
+  const b = $("btnSearch"); if (b) b.setAttribute("aria-expanded", "false");
+  if (state.search) { state.search.active = false; }
+  clearSearchMarks(); renderWikiHits(); setSearchCount();
+}
+function toggleSearch() {
+  const p = $("searchPanel");
+  if (!p) return;
+  if (p.classList.contains("hidden")) openSearch(); else closeSearch();
+}
+function wireSearch() {
+  const b = $("btnSearch"); if (b) b.onclick = toggleSearch;
+  const inp = $("searchInput");
+  if (inp) {
+    inp.addEventListener("input", () => {
+      const q = inp.value.trim();
+      if (_searchTimer) clearTimeout(_searchTimer);
+      if (q.length < SEARCH_MIN) { runSearch(q); return; }
+      _searchTimer = setTimeout(() => runSearch(q), 220);
+    });
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); searchStep(e.shiftKey ? -1 : 1); }
+      else if (e.key === "Escape") { e.preventDefault(); closeSearch(); }
+    });
+  }
+  const pv = $("btnPrev"); if (pv) pv.onclick = () => searchStep(-1);
+  const nx = $("btnNext"); if (nx) nx.onclick = () => searchStep(1);
+  const wk = $("searchWiki");
+  if (wk) wk.addEventListener("change", () => { const q = ($("searchInput") || {}).value; if (q && q.trim().length >= SEARCH_MIN) runSearch(q.trim()); });
+}
+
 /* ---------------- wire ---------------- */
 window.addEventListener("DOMContentLoaded", async () => {
   $("btnToken").onclick = requestToken;
@@ -702,6 +1057,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("tok").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); verify(); } });
   $("btnLogout").onclick = logout;
   $("btnDebug").onclick = debugChat;
+  wireSearch();
   $("btnAttach").onclick = () => $("file").click();
   $("file").addEventListener("change", async (e) => {
     for (const f of Array.from(e.target.files || [])) await upload(f);
@@ -733,18 +1089,22 @@ window.addEventListener("DOMContentLoaded", async () => {
       btn.title = "Detener el turno";
       btn.textContent = "Detener";
       btn.onclick = stopTurn;
-      top.insertBefore(btn, $("btnNotify"));
+      top.insertBefore(btn, $("btnSearch"));
     }
   }
   const onNotify = async () => {
-    const btn = $("btnNotify");
+    const btn = $("statusDot");
     const reg = await navigator.serviceWorker.ready.catch(() => null);
     const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
     const off = btn.classList.contains("off");
     if (sub && !off) await disablePush(btn); else await enablePush(btn);
   };
-  $("btnNotify").onclick = onNotify;
-  $("btnPushGo").onclick = () => enablePush($("btnNotify"));
+  const dotEl = $("statusDot");
+  if (dotEl) {
+    dotEl.onclick = onNotify;
+    dotEl.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onNotify(); } });
+  }
+  $("btnPushGo").onclick = () => enablePush($("statusDot"));
 
   // Pegado al fondo: si el usuario arrastra arriba, paramos de arrastrarle; si vuelve
   // abajo, volvemos a pegarnos. Es la pieza que faltaba (el flag estaba declarado y sin usar).
@@ -761,6 +1121,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   if (me.ok && me.data && me.data.email) OWNER_EMAIL = String(me.data.email);
   if (me.ok && me.data && me.data.brand) {
     const b = String(me.data.brand);
+    BRAND = b;
     const bEl = document.querySelector(".brand"); if (bEl) bEl.textContent = b;
     const txEl = $("typingText"); if (txEl) txEl.textContent = b + " esta trabajando...";
     document.title = b;
@@ -769,16 +1130,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) reportVisibleFalse();
     else reportView(true);
-    if (!document.hidden) pushState($("btnNotify"));
+    if (!document.hidden) pushState($("statusDot"));
   });
   window.addEventListener("pagehide", () => { reportVisibleFalse(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("searchPanel") && !$("searchPanel").classList.contains("hidden")) closeSearch(); });
 
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.addEventListener("message", (e) => {
       if (e.data && e.data.type === "new-message") tick();
     });
-    navigator.serviceWorker.register("/sw.js").then((reg) => { pushState($("btnNotify")); startHeartbeat(reg); }).catch(() => {});
+    navigator.serviceWorker.register("/sw.js").then((reg) => { pushState($("statusDot")); startHeartbeat(reg); }).catch(() => {});
     // Auto-recuperacion: re-verifica los avisos cada 60 s mientras la app esta abierta.
-    setInterval(() => { if (!document.hidden) pushState($("btnNotify")); }, 60000);
+    setInterval(() => { if (!document.hidden) pushState($("statusDot")); }, 60000);
   }
 });

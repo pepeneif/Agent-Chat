@@ -1,4 +1,4 @@
-const CACHE = "chat-pwa-v35";
+const CACHE = "chat-pwa-v50";
 const ASSETS = ["/", "/index.html", "/theme.css", "/app.js", "/icon.svg", "/icon-512.png", "/apple-touch-icon.png", "/manifest.webmanifest"];
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
@@ -20,7 +20,7 @@ self.addEventListener("message", (e) => {
 self.addEventListener("push", (e) => {
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: (e.data && e.data.text && e.data.text()) || "" }; }
-  const title = d.title || "Manager";
+  const title = d.title || "Chat";
   const body = d.body || "Nuevo mensaje";
   e.waitUntil((async () => {
     // Si ya hay una ventana del chat visible, no notificamos: el usuario esta leyendo.

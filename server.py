@@ -10,9 +10,11 @@ respuestas, con acuse rapido + respuesta final, y notificaciones Web Push (VAPID
 Toda la configuracion se toma de variables de entorno (ver .env.example).
 """
 import os, re, json, time, uuid, sqlite3, secrets, smtplib, threading, mimetypes, traceback
+import unicodedata, subprocess, shutil, tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 from urllib.error import HTTPError
+import contextlib
 from urllib.request import urlopen, Request
 from email.message import EmailMessage
 from email.utils import make_msgid, formatdate
@@ -31,7 +33,7 @@ OMB        = os.environ.get("CHAT_OMB", "http://127.0.0.1:8799")
 BOT_ID     = os.environ.get("CHAT_BOT_ID", "")
 THREAD_ID  = os.environ.get("CHAT_THREAD_ID", "")
 OWNER      = (os.environ.get("CHAT_OWNER", "")).strip().lower()
-BRAND      = os.environ.get("CHAT_BRAND", "Manager").strip() or "Manager"
+BRAND      = os.environ.get("CHAT_BRAND", "Agent Chat").strip() or "Agent Chat"
 MAIL_FROM_H = os.environ.get("CHAT_MAIL_NAME", BRAND)
 MAIL_FROM_A = os.environ.get("CHAT_MAIL_FROM", "no-reply@example.com")
 MAIL_FROM_D = os.environ.get("CHAT_MAIL_DOMAIN", MAIL_FROM_A.split("@", 1)[1] if "@" in MAIL_FROM_A else "example.com")
@@ -41,16 +43,11 @@ SESSION_DAYS = 30
 TOKEN_MIN    = 15
 MAX_UPLOAD   = 25 * 1024 * 1024
 
-# Tope global de generacion de codigos, independiente del limite por IP. Evita
-# inundar el buzon del dueno con IPs rotativas. Configurable con la variable de
-# entorno CHAT_TOKEN_LIMIT_PER_HOUR; el valor sin configurar es deliberadamente bajo.
-TOKEN_GEN_LIMIT_PER_HOUR = int(os.environ.get("CHAT_TOKEN_LIMIT_PER_HOUR", "10"))
-
 # Opcion B: una sola burbuja "en curso" por turno de Manager, actualizada en silencio
 # durante el turno, con un push al nacer y otro forzado al cerrar. Desactivada por
 # defecto para no alterar la via A (mirror actual); se activa con CHAT_OPTION_B=1.
 OPTION_B = os.environ.get("CHAT_OPTION_B", "").strip().lower() in ("1", "true", "yes", "on")
-OPTION_B_START_PUSH = os.environ.get("CHAT_B_START_PUSH", "Manager esta trabajando...").strip()
+OPTION_B_START_PUSH = os.environ.get("CHAT_B_START_PUSH", BRAND + " esta trabajando...").strip()
 
 # Control de turno del usuario (F1-F4, optativo): steer nativo de OMB cuando el bot esta
 # ocupado, boton "Detener" (interrupt) y estado "trabajando" leido del OMB real. Off por
@@ -63,6 +60,7 @@ def _is_stop_text(text):
                              (text or "").strip(), re.I))
 
 os.makedirs(DATA_DIR, exist_ok=True)
+OMB_ATTACH_CONTAINER = os.environ.get("CHAT_OMB_CONTAINER", "").strip()
 FILES_DIR = os.path.join(DATA_DIR, "files")
 os.makedirs(FILES_DIR, exist_ok=True)
 DB = os.path.join(DATA_DIR, "chat.db")
@@ -105,11 +103,23 @@ _waiting_bots = {"since": None, "peers": []}
 _waiting_bots_lock = threading.Lock()
 
 # ---------- db ----------
+@contextlib.contextmanager
 def db():
+    # OJO: el "with" de sqlite3 NO cierra la conexion (solo commit/rollback). Por eso este
+    # db() es un context manager explicito que SI cierra: sin esto cada consulta filtraba un
+    # descriptor de fichero (~510 por dia en el mirror) hasta agotar el limite de 1024 y
+    # dejar el backend mudo (502). Bug encontrado el 2026-10-14 con helma.merkle.space.
     c = sqlite3.connect(DB, timeout=15)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    return c
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        yield c
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 def init_db():
     with db() as c:
@@ -142,6 +152,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS omb_push_ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT, turn_id TEXT NOT NULL, phase TEXT NOT NULL,
             body TEXT NOT NULL, at INTEGER NOT NULL, UNIQUE(turn_id, phase));
+        CREATE TABLE IF NOT EXISTS omb_user_deliveries (
+            source_id TEXT PRIMARY KEY, message_id TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_messages_uid ON messages(uid);
         """)
         columns = {row[1] for row in c.execute("PRAGMA table_info(omb_push_events)")}
         if "attempts" not in columns:
@@ -196,8 +209,12 @@ def add_msg(role, content, uid=None):
                   (mid, role, content, now_ms(), uid))
     return {"id": mid, "role": role, "content": content, "at": now_ms()}
 
-def history(limit=60, before=None):
+def history(limit=60, before=None, after=None):
     with db() as c:
+        if after:
+            rows = c.execute("SELECT * FROM messages WHERE at>? ORDER BY at ASC LIMIT ?",
+                             (int(after), limit)).fetchall()
+            return [dict(r) for r in rows]
         if before:
             rows = c.execute("SELECT * FROM messages WHERE at<? ORDER BY at DESC LIMIT ?",
                              (int(before), limit)).fetchall()
@@ -205,14 +222,180 @@ def history(limit=60, before=None):
             rows = c.execute("SELECT * FROM messages ORDER BY at DESC LIMIT ?", (limit,)).fetchall()
     return list(reversed([dict(r) for r in rows]))
 
-# F1 (S-2026-11-15): aislar SMTP en un hilo daemon para que /api/request-token
-# responda con el mismo coste tanto si el email coincide como si no. El fallo SMTP
-# se registra en mail.log y NUNCA se devuelve como 502 al cliente.
-def _send_token_safely(to_addr, token):
+# ---------- busqueda (2026-10-15) ----------
+# Busca en el historial del chat (lo que NO se ha depurado: lo borrado ya no existe) y,
+# opcionalmente, en la wiki de memoria del bot (memory/*.md dentro del volumen /data de
+# OMB). La wiki se extrae en SOLO LECTURA con `docker exec <contenedor> tar` (el usuario
+# del servicio esta en el grupo docker), a un directorio temporal con cache de TTL. Nada
+# se escribe de vuelta ni se modifica ningun permiso. Apagable con CHAT_SEARCH=0.
+
+def _fold_char(ch):
+    """Pliega un caracter a minuscula sin diacriticos, MANTENIENDO la longitud (1 char
+    -> 1 char) para que los indices del texto plegado coincidan con el original."""
+    d = unicodedata.normalize("NFD", ch)   # NFD (no NFKD): el frontal pliega igual (H1 auditoria 2026-10-15)
+    base = "".join(c for c in d if not unicodedata.combining(c))
+    if len(base) == 1:
+        return base.lower()
+    return ch.lower() if len(ch) == 1 else ch
+
+def _fold(text):
+    return "".join(_fold_char(ch) for ch in (text or ""))
+
+def _occurrences(hay, needle):
+    """Posiciones no solapadas de `needle` en `hay` (ambos ya plegados)."""
+    out = []
+    if not needle:
+        return out
+    start = 0
+    while True:
+        i = hay.find(needle, start)
+        if i < 0:
+            break
+        out.append(i)
+        start = i + len(needle)
+    return out
+
+def _snippet(text, pos, qlen, width=60):
+    a = max(0, pos - width)
+    b = min(len(text), pos + qlen + width)
+    frag = text[a:b].replace("\n", " ").strip()
+    return ("\u2026" if a > 0 else "") + frag + ("\u2026" if b < len(text) else "")
+
+def search_chat(q):
+    nq = _fold(q)
+    if not nq:
+        return []
+    out = []
+    with db() as c:
+        cur = c.execute("SELECT id,role,content,at FROM messages ORDER BY at,id")
+        for r in cur:   # iterar el cursor: no cargar toda la tabla en RAM (H2 auditoria)
+            content = r["content"] or ""
+            occ = _occurrences(_fold(content), nq)
+            if not occ:
+                continue
+            if r["role"] == "system":
+                kind = "system"
+            elif r["role"] == "user":
+                kind = "user"
+            else:
+                kind = "bot"
+            out.append({"id": r["id"], "role": r["role"], "kind": kind, "at": r["at"],
+                        "count": len(occ), "snippet": _snippet(content, occ[0], len(nq))})
+            if len(out) >= SEARCH_LIMIT:
+                break
+    return out
+
+def _wiki_files(force=False):
+    """Devuelve la wiki cacheada (lista de {path, lines, folded} con las lineas ya
+    plegadas). NUNCA bloquea la peticion con la extraccion: si no hay cache, dispara el
+    refresco en segundo plano y devuelve [] (el siguiente intento ya la tendra)."""
+    now = time.time()
+    if _wiki["files"] is not None and (now - _wiki["at"]) < WIKI_CACHE_TTL and not force:
+        return _wiki["files"]
+    _wiki_kick()          # refresco asincrono (una sola vez a la vez)
+    return _wiki["files"] or []
+
+def _wiki_kick():
+    with _wiki["lock"]:
+        if _wiki["loading"]:
+            return
+        _wiki["loading"] = True
+    threading.Thread(target=_wiki_build, daemon=True, name="chat-wiki").start()
+
+def _wiki_build():
     try:
-        send_token_email(to_addr, token)
-    except Exception as e:
-        log_line(f"MAIL FALLO {e} to={to_addr}")
+        files = _wiki_extract()
+        with _wiki["lock"]:
+            _wiki["files"] = files
+            _wiki["at"] = time.time()
+            _wiki["loading"] = False
+    except Exception:
+        with _wiki["lock"]:
+            _wiki["loading"] = False
+
+def _wiki_prewarm():
+    """Precalienta la wiki al arrancar y la refresca sola cada WIKI_CACHE_TTL/2."""
+    while True:
+        _wiki_build_refresh()
+        time.sleep(max(60, WIKI_CACHE_TTL // 2))
+
+def _wiki_build_refresh():
+    try:
+        files = _wiki_extract()
+        with _wiki["lock"]:
+            _wiki["files"] = files
+            _wiki["at"] = time.time()
+    except Exception:
+        pass
+
+def _wiki_extract():
+    """Extrae en SOLO LECTURA los .md de `WIKI_DIRS` bajo `WIKI_WORKSPACE` del volumen
+    /data de OMB, usando `docker exec <ctr> tar` a un tmp. Nunca escribe en el volumen.
+    Devuelve [{path, lines, folded}] con el texto de cada linea y su version plegada."""
+    tmp = None
+    try:
+        if not WIKI_CONTAINER or not shutil.which("docker"):
+            return []
+        rel = os.path.relpath(WIKI_WORKSPACE, "/data")
+        if rel.startswith("..") or os.path.isabs(rel):
+            return []
+        tmp = tempfile.mkdtemp(prefix="chatwiki-")
+        proc = subprocess.Popen(
+            ["docker", "exec", WIKI_CONTAINER, "tar", "-C", "/data", "-cf", "-", "./" + rel],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run(["tar", "-C", tmp, "-xf", "-"], stdin=proc.stdout,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=True, timeout=WIKI_EXTRACT_TIMEOUT)   # H4: tope global
+        finally:
+            proc.stdout.close()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        base = os.path.join(tmp, rel)
+        out = []
+        for d in WIKI_DIRS:
+            root = os.path.join(base, d)
+            for dp, _dirs, names in os.walk(root):
+                for nm in names:
+                    if not nm.endswith(".md"):
+                        continue
+                    fp = os.path.join(dp, nm)
+                    try:
+                        with open(fp, encoding="utf-8", errors="replace") as f:
+                            txt = f.read()
+                    except Exception:
+                        continue
+                    lines = txt.split("\n")
+                    out.append({"path": os.path.relpath(fp, base),
+                                "lines": lines,
+                                "folded": [_fold(x) for x in lines]})
+        return out
+    except Exception:
+        return []
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+def search_wiki(q, max_hits=15):
+    nq = _fold(q)
+    if not nq:
+        return []
+    out = []
+    for f in _wiki_files():
+        hits = []
+        total = 0
+        for i, fl in enumerate(f["folded"]):
+            occ = _occurrences(fl, nq)
+            if occ:
+                total += len(occ)
+                if len(hits) < max_hits:
+                    hits.append({"line": i + 1, "text": (f["lines"][i] or "").strip()[:200]})
+        if total:
+            out.append({"path": f["path"], "count": total, "hits": hits})
+    return out
+
 
 # ---------- email ----------
 def send_token_email(to_addr, token):
@@ -267,6 +450,23 @@ def omb_post(path, payload):
 
 DEBUG_KEEP = int(os.environ.get("CHAT_DEBUG_KEEP", "40"))   # legado; sustituido por CHAT_PURGE_PCT
 PURGE_PCT = float(os.environ.get("CHAT_PURGE_PCT", "66"))
+
+# --- Busqueda (2026-10-15) -------------------------------------------------
+# Busca en el historial del chat (no depurado) y, opcionalmente, en la wiki de memoria
+# del bot (archivos memory/*.md dentro del volumen /data de OMB). El backend corre como
+# usuario del host, fuera del contenedor, asi que la wiki se extrae en SOLO LECTURA con
+# `docker exec ... tar` (el usuario esta en el grupo docker). Sin persistir nada fuera de
+# una cache temporal con TTL. Todo apagable con CHAT_SEARCH=0.
+SEARCH_ON    = os.environ.get("CHAT_SEARCH", "1").strip().lower() in ("1", "true", "yes", "on")
+SEARCH_MIN   = int(os.environ.get("CHAT_SEARCH_MIN", "2"))       # letras minimas para lanzar
+SEARCH_LIMIT = int(os.environ.get("CHAT_SEARCH_LIMIT", "400"))   # tope de coincidencias chat
+WIKI_CONTAINER = os.environ.get("CHAT_WIKI_CONTAINER", "").strip()
+WIKI_WORKSPACE = os.environ.get("CHAT_WIKI_WORKSPACE",
+                                "")
+WIKI_DIRS    = [d.strip() for d in os.environ.get("CHAT_WIKI_DIRS", "memory").split(",") if d.strip()]
+WIKI_CACHE_TTL = int(os.environ.get("CHAT_WIKI_CACHE_TTL", "300"))  # segundos
+WIKI_EXTRACT_TIMEOUT = int(os.environ.get("CHAT_WIKI_TIMEOUT", "45"))  # tope de la extraccion
+_wiki = {"at": 0, "files": None, "loading": False, "lock": threading.Lock()}
 
 def _debug_busy(on):
     """Marca/desmarca el flag de trabajo (para que el chat muestre 'Manager esta trabajando')."""
@@ -403,6 +603,7 @@ MIRROR_PENDING_TTL_MS = 60 * 60 * 1000
 MIRROR_BOOTSTRAP_MS = 24 * 60 * 60 * 1000
 MIRROR_PREF = "omb_last_message_id"
 MIRROR_BOOTSTRAP_PREF = "omb_bootstrap_at"
+USER_MIRROR_DEDUP_WINDOW_MS = 5 * 60 * 1000  # ±5 min around OMB `at` to match a PWA-written copy
 
 def _omb_unseen(cursor, cutoff):
     """Read backwards to the persisted cursor, then return messages oldest first."""
@@ -581,14 +782,215 @@ def _emit_b_push(body, force):
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _user_text_key(text):
+    """Normaliza runas de espacio para comparar copia local vs OMB sin duplicar.
+    La PWA usa \n; OMB puede devolver \r\n, dobles espacios o trailing spaces.
+    """
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _record_omb_user(conn, source_id, body, message_at):
+    """Ingiere un role=user/kind=text de OMB.
+
+    Clave de dedup estable = source_id (message["id"] de OMB), guardada en
+    omb_user_deliveries. sendId puede variar o faltar entre reenvios: no se usa.
+
+    Orden:
+    1. tombstone por source_id -> no-op (idempotente).
+    2. exactamente una copia local (uid IS NULL, mismo texto normalizado, ±ventana)
+       -> se enlaza con uid=source_id, sin insertar.
+    3. cero copias -> se inserta con el `at` real de OMB y uid=source_id.
+    4. dos o mas copias -> se inserta tambien la fila de OMB (nunca se pierde);
+       no se enlaza ninguna copia local para no adivinar.
+    """
+    if conn.execute("SELECT 1 FROM omb_user_deliveries WHERE source_id=? LIMIT 1",
+                    (source_id,)).fetchone():
+        return
+    user_at = message_at or now_ms()
+    lo = user_at - USER_MIRROR_DEDUP_WINDOW_MS
+    hi = user_at + USER_MIRROR_DEDUP_WINDOW_MS
+    wanted = _user_text_key(body)
+    local_rows = conn.execute(
+        "SELECT id, content FROM messages "
+        "WHERE role='user' AND uid IS NULL AND at BETWEEN ? AND ? ORDER BY at,id",
+        (lo, hi)).fetchall()
+    candidates = [row["id"] for row in local_rows if _user_text_key(row["content"]) == wanted]
+    if len(candidates) == 1:
+        message_id = candidates[0]
+        conn.execute("UPDATE messages SET uid=? WHERE id=?", (source_id, message_id))
+    else:
+        # 0 candidatos: nuevo (UI de OMB sin copia local, o ventana superada).
+        # >=2: no adivinamos cual enlazar, pero TAMPOCO perdemos el mensaje OMB.
+        message_id = uuid.uuid4().hex
+        conn.execute("INSERT INTO messages(id,role,content,at,uid) VALUES(?,?,?,?,?)",
+                     (message_id, "user", body, user_at, source_id))
+    conn.execute("INSERT OR IGNORE INTO omb_user_deliveries(source_id,message_id) VALUES(?,?)",
+                 (source_id, message_id))
+
+
+def _routine_body(message):
+    """Cuerpo legible de un mensaje kind=='routine.run' de OMB.
+
+    OMB pinta la salida de una rutina como tarjeta: `routineRun.summary` y un
+    desplegable que la UI nativa recorta. Aqui queremos el informe APLANADO e
+    inline, asi que preferimos `text` (trae el cuerpo completo) y caemos a
+    `summary` solo si falta. Devuelve None si no hay nada que ingerir.
+    """
+    rr = message.get("routineRun") or {}
+    name = str(rr.get("routineName") or "Rutina").strip() or "Rutina"
+    status = str(rr.get("status") or "").strip()
+    # Opcion 1 (2026-10-16): la tarjeta de rutina se espeja SOLO como aviso, sin
+    # el cuerpo del informe. El informe completo lo publica el mensaje final de
+    # Manager (consolidado), de modo que el formato final aparece UNA sola vez.
+    # Antes esta funcion traia el texto completo de la ejecucion -> Jose lo veia
+    # repetido (tarjeta + borrador del delegado + consolidado).
+    head = "**Rutina: %s**" % name
+    if status and status != "completed":
+        head += " (%s)" % status
+    return head
+
+
+def _record_routine(conn, message, body):
+    """Ingiere un routine.run como mensaje normal del chat (idempotente).
+
+    Dedup por source_id en `omb_deliveries`, igual que los mensajes de texto.
+    El `at` es el de OMB para que el informe quede en su sitio cronologico.
+    `body` se calcula FUERA del lock (ver _record_omb): construirlo hace una
+    peticion HTTP a OMB y no debe retener `_dblock`.
+    Devuelve True si inserto, False si ya estaba o no habia cuerpo.
+    """
+    if not body:
+        return False
+    source_id = message["id"]
+    if conn.execute("SELECT 1 FROM omb_deliveries WHERE source_id=? LIMIT 1",
+                    (source_id,)).fetchone():
+        return False
+    message_at = int(message.get("at", 0) or 0)
+    mid = uuid.uuid4().hex
+    conn.execute("INSERT INTO messages(id,role,content,at,uid) VALUES(?,?,?,?,?)",
+                 (mid, "bot", body, message_at if message_at > 0 else now_ms(), None))
+    conn.execute("INSERT INTO omb_deliveries(source_id,message_id) VALUES(?,?)",
+                 (source_id, mid))
+    return True
+
+
+def _download_omb_attachment(att):
+    """Descarga un adjunto que OMB sirve en /api/attachments/<fichero>.
+
+    OMB entrega los adjuntos como {kind, path, mime[, name]} con un `path` DENTRO del
+    contenedor de OMB: el host (donde corre este backend) no puede leerlo. Pero
+    OMB SI sirve el fichero por HTTP, asi que se descarga de ahi y se guarda como un
+    fichero local mas (misma tabla `files` y misma URL /api/file/<id> que los subidos a
+    mano), de modo que el visor lo pinta sin cambios. Devuelve (fid,name,mime,size) o None.
+    OJO: hace HTTP -> llamar SIEMPRE FUERA de `_dblock`.
+    """
+    path = (att or {}).get("path") or ""
+    base = os.path.basename(path)
+    if not base:
+        return None
+    data = None
+    # 1) via HTTP: es la via limpia, pero OMB solo sirve por HTTP los adjuntos de tipo
+    #    imagen (comprobado: los .png dan 200 y los .csv 404 "no such attachment").
+    try:
+        with urlopen(OMB + "/api/attachments/" + quote(base), timeout=30) as r:
+            data = r.read()
+    except Exception:
+        data = None
+    # 2) respaldo: leerlo directamente del contenedor de OMB (el servicio corre como un
+    #    usuario del grupo docker). Cubre los no-imagen (CSV, TXT, PDF...) que OMB no sirve.
+    if data is None and OMB_ATTACH_CONTAINER:
+        try:
+            out = subprocess.run(
+                ["docker", "exec", OMB_ATTACH_CONTAINER, "cat", path],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+            if out.returncode == 0 and out.stdout:
+                data = out.stdout
+        except Exception:
+            data = None
+    if not data or len(data) > MAX_UPLOAD:
+        return None
+    fid = uuid.uuid4().hex
+    with open(os.path.join(FILES_DIR, fid), "wb") as f:
+        f.write(data)
+    mime = att.get("mime") or mimetypes.guess_type(base)[0] or "application/octet-stream"
+    name = att.get("name") or base
+    name = re.sub(r"[^\w.\-() ]", "_", str(name))[:120] or "adjunto"
+    return fid, name, mime, len(data)
+
+
+def _record_omb_attachments(message, source_id, message_at):
+    """Espeja en el chat un mensaje de OMB que trae SOLO adjuntos (text vacio).
+
+    Antes se descartaba: `is_text` exige cuerpo y nadie miraba `attachments`, asi que las
+    imagenes que Manager adjunta (graficas, capturas) nunca aparecian en la PWA. Ahora se
+    descargan, se registran como ficheros locales y se publica un mensaje cuyo cuerpo lleva
+    la URL /api/file/<id>: el visor ya sabe pintar imagenes a partir de esa URL.
+    Idempotente por source_id. Devuelve True si dejo mensaje.
+    """
+    if source_id is None:
+        return False
+    # 1) descargar (HTTP) fuera del lock
+    got = []
+    for att in (message.get("attachments") or []):
+        item = _download_omb_attachment(att)
+        if item:
+            got.append(item)
+    if not got:
+        return False
+    with _dblock, db() as conn:
+        if conn.execute("SELECT 1 FROM omb_deliveries WHERE source_id=? LIMIT 1",
+                        (source_id,)).fetchone():
+            return False
+        links = []
+        for fid, name, mime, size in got:
+            conn.execute("INSERT OR IGNORE INTO files(id,name,mime,size,created) VALUES(?,?,?,?,?)",
+                         (fid, name, mime, size, now_ms()))
+            links.append("/api/file/" + fid)
+        mid = uuid.uuid4().hex
+        conn.execute("INSERT INTO messages(id,role,content,at,uid) VALUES(?,?,?,?,?)",
+                     (mid, "bot", "\n".join(links), message_at if message_at > 0 else now_ms(), None))
+        conn.execute("INSERT INTO omb_deliveries(source_id,message_id) VALUES(?,?)",
+                     (source_id, mid))
+        conn.execute("INSERT OR REPLACE INTO prefs(k,v) VALUES(?,?)", (MIRROR_PREF, source_id))
+    return True
+
+
 def _record_omb(message, legacy_since, legacy_until):
     _ingest_waiting_activity(message)
     source_id = message["id"]
     body = (message.get("text") or "").strip()
-    is_text = message.get("role") == "bot" and message.get("kind") == "text" and bool(body)
+    role = message.get("role")
+    kind = message.get("kind")
+    is_text = role == "bot" and kind == "text" and bool(body)
     turn_id = message.get("turnId")
     turn_id = turn_id if isinstance(turn_id, str) and turn_id.strip() else None
     message_at = int(message.get("at", 0) or 0)
+    if role == "user" and kind == "text" and bool(body):
+        with _dblock, db() as conn:
+            _record_omb_user(conn, source_id, body, message_at)
+            conn.execute("INSERT OR REPLACE INTO prefs(k,v) VALUES(?,?)", (MIRROR_PREF, source_id))
+        return
+    if role == "bot" and kind == "routine.run":
+        # H1: el cuerpo (con su HTTP a OMB) se construye ANTES del lock.
+        # H2: el cursor solo avanza si de verdad se inserto el informe.
+        routine_body = _routine_body(message)
+        with _dblock, db() as conn:
+            inserted = _record_routine(conn, message, routine_body)
+            if inserted:
+                conn.execute("INSERT OR REPLACE INTO prefs(k,v) VALUES(?,?)", (MIRROR_PREF, source_id))
+        return
+    if role == "bot" and kind == "text" and message.get("attachments"):
+        # Adjuntos sin texto (graficas, capturas, CSV): espejarlos como ficheros locales.
+        _record_omb_attachments(message, source_id, message_at)
+        return
+    if role == "bot" and kind == "text" and isinstance(message.get("from"), dict):
+        # Opcion 1 (2026-10-16): el borrador del delegado (respuesta de otro bot,
+        # p.ej. "@Analista replied to the delegated task: ...") NO se espeja; el
+        # mensaje final de Manager ya consolida su contenido. Solo se avanza el
+        # cursor para no re-leerlo. Evita el informe repetido.
+        with _dblock, db() as conn:
+            conn.execute("INSERT OR REPLACE INTO prefs(k,v) VALUES(?,?)", (MIRROR_PREF, source_id))
+        return
     if OPTION_B and is_text and turn_id:
         _record_omb_option_b(source_id, body, turn_id, message_at, message)
         with _dblock, db() as conn:
@@ -885,7 +1287,7 @@ def send_push(title, body, force=False):
             info = json.loads(sub)
             webpush(subscription_info=info, data=payload,
                     vapid_private_key=VAPID["private_key"],
-                    vapid_claims={"sub": os.environ.get("VAPID_SUB", "mailto:no-reply@example.com")})
+                    vapid_claims={"sub": "mailto:manager@merkle.space"})
         except WebPushException as error:
             code = getattr(getattr(error, "response", None), "status_code", None)
             if code in (404, 410):
@@ -1153,7 +1555,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._static(p.lstrip("/"))
             if p == "/api/me":
                 return self._json(200, {"ok": self._session_ok(), "brand": BRAND,
-                                         "email": OWNER, "turnControl": bool(TURN_CONTROL)})
+                                         "email": OWNER, "turnControl": bool(TURN_CONTROL),
+                                         "search": bool(SEARCH_ON), "searchMin": SEARCH_MIN})
             if p == "/api/push/key":
                 if not self._require():
                     return
@@ -1167,15 +1570,20 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 q = parse_qs(u.query)
                 before = q.get("before", [None])[0]
+                after = q.get("after", [None])[0]
                 lim = min(int(q.get("limit", ["60"])[0] or 60), 200)
                 _viewer["last"] = now_ms()
                 busy = _omb_busy_bool() if TURN_CONTROL else bool(_busy["on"])
                 busy_since = _busy_since_ms(busy)
                 waiting_bots = _waiting_bots_payload() if OPTION_B else None
-                return self._json(200, {"messages": history(lim, before),
+                return self._json(200, {"messages": history(lim, before, after),
                                          "busy": busy,
                                          "busySince": busy_since,
                                          "waitingBots": waiting_bots})
+            if p == "/api/search":
+                if not self._require():
+                    return
+                return self._search(u)
             if p.startswith("/api/file/"):
                 if not self._require():
                     return
@@ -1270,9 +1678,20 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- auth ----
     def _client_ip(self):
-        return (self.headers.get("cf-connecting-ip")
-                or (self.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-                or self.client_address[0])
+        # NV1: solo se confia en cabeceras si la conexion viene del proxy local.
+        # Este backend escucha solo en 127.0.0.1, asi que un peer loopback es Caddy,
+        # que sobrescribe X-Forwarded-For con {remote_host}. cf-connecting-ip solo
+        # se cree con CHAT_TRUST_CF=1 (despliegue real detras de Cloudflare).
+        peer = self.client_address[0]
+        if peer in ("127.0.0.1", "::1"):
+            if os.environ.get("CHAT_TRUST_CF") == "1":
+                cf = (self.headers.get("cf-connecting-ip") or "").strip()
+                if cf:
+                    return cf
+            xff = (self.headers.get("x-forwarded-for") or "").split(",")[-1].strip()
+            if xff:
+                return xff
+        return peer
 
     def _rate_ok(self, key, limit, window):
         with _dblock, db() as c:
@@ -1291,31 +1710,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(429, {"error": "too many requests"})
         body = json.loads(self._body().decode("utf-8") or "{}")
         email = (body.get("email") or "").strip()
-        # F1 (S-2026-11-15, segunda vuelta): el camino de la peticion es identico
-        # para un email que coincide y uno que no, por construccion. Toda la logica
-        # especifica del dueno se mueve a un hilo daemon; no hay comparacion de email,
-        # comprobacion del tope global ni escritura en logins en el camino HTTP. La
-        # respuesta se escribe antes de lanzar el hilo para que ni siquiera el arranque
-        # o la primera ejecucion del trabajo asincrono pueda contaminar la latencia.
-        self._json(200, {"ok": True})
-        threading.Thread(target=self._issue_token_if_owner, args=(email,), daemon=True).start()
-
-    def _issue_token_if_owner(self, email):
         if email.lower() != OWNER:
-            return
-        # F2 (S-2026-11-15): el tope global se comprueba dentro del hilo, antes de
-        # generar o insertar el token. Si esta agotado ya no hay canal de respuesta:
-        # solo se deja constancia en mail.log y el HTTP ya habia devuelto 200.
-        if not self._rate_ok("token_gen_global", TOKEN_GEN_LIMIT_PER_HOUR, 3600):
-            log_line("TOKEN LIMITE GLOBAL alcanzado, no se genero token")
-            return
+            time.sleep(1.0)
+            return self._json(200, {"ok": True})
         tok = secrets.token_urlsafe(18)
         with _dblock, db() as c:
             c.execute("INSERT INTO logins(token,created,expires,used) VALUES(?,?,?,0)",
                       (tok, int(time.time()), int(time.time()) + TOKEN_MIN * 60))
-        # El envio SMTP es asincrono y los fallos quedan en mail.log mediante
-        # _send_token_safely; nunca forman parte de la respuesta HTTP.
-        _send_token_safely(OWNER, tok)
+        try:
+            send_token_email(OWNER, tok)
+        except Exception as e:
+            traceback.print_exc()
+            return self._json(502, {"error": "mail failed"})
+        return self._json(200, {"ok": True})
 
     def _verify(self):
         ip = self._client_ip()
@@ -1428,6 +1835,26 @@ class Handler(BaseHTTPRequestHandler):
             c.execute("DELETE FROM push_subs WHERE endpoint=?", (endpoint,))
         return self._json(200, {"ok": True})
 
+    def _search(self, u):
+        """GET /api/search?q=...&wiki=1 -> coincidencias en el chat (no depurado) y, si
+        wiki=1, tambien en la wiki de memoria. Sin minimo de letras aqui: el front exige
+        SEARCH_MIN; el backend solo rechaza la consulta vacia."""
+        if not SEARCH_ON:
+            return self._json(200, {"enabled": False, "chat": [], "wiki": []})
+        q = parse_qs(u.query)
+        term = (q.get("q", [""])[0] or "").strip()
+        want_wiki = (q.get("wiki", ["0"])[0] or "0").strip().lower() in ("1", "true", "yes", "on")
+        if not term:
+            return self._json(200, {"enabled": True, "q": "", "chat": [], "wiki": []})
+        chat_hits = search_chat(term)
+        wiki_hits = search_wiki(term) if want_wiki else []
+        return self._json(200, {
+            "enabled": True, "q": term,
+            "chat": chat_hits, "wiki": wiki_hits,
+            "chatCount": len(chat_hits),
+            "wikiCount": sum(h["count"] for h in wiki_hits),
+        })
+
     def _file(self, fid):
         if not re.fullmatch(r"[0-9a-f]{32}", fid or ""):
             return self._json(404, {"error": "not found"})
@@ -1440,7 +1867,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "gone"})
         with open(path, "rb") as f:
             b = f.read()
-        inline = r["mime"].startswith("image/") or r["mime"].startswith("text/") or r["mime"] == "application/pdf"
+        # Solo las imagenes se sirven inline (para verlas en la burbuja). Cualquier otro
+        # fichero (csv, pdf, docx, txt...) va como `attachment` para que el navegador lo
+        # DESCARGUE a Archivos del telefono en vez de abrirlo en un visor sin boton de cerrar
+        # (peticion de Jose, 2026-10-19).
+        inline = r["mime"].startswith("image/")
         cd = ("inline" if inline else "attachment")
         disp = f'{cd}; filename="{quote(r["name"])}"'
         return self._bytes(200, b, r["mime"] or "application/octet-stream", disp=disp)
@@ -1502,5 +1933,7 @@ class Server(ThreadingHTTPServer):
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=_mirror_follow, daemon=True, name="omb-mirror").start()
+    if SEARCH_ON:
+        threading.Thread(target=_wiki_prewarm, daemon=True, name="chat-wiki-warm").start()
     print(f"chat backend on 127.0.0.1:{PORT}  data={DATA_DIR}", flush=True)
     Server(("127.0.0.1", PORT), Handler).serve_forever()
