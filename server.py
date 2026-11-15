@@ -1568,9 +1568,15 @@ class Handler(BaseHTTPRequestHandler):
             if p in ("/sw.js", "/theme.css", "/app.js", "/icon.svg", "/icon-512.png", "/apple-touch-icon.png"):
                 return self._static(p.lstrip("/"))
             if p == "/api/me":
-                return self._json(200, {"ok": self._session_ok(), "brand": BRAND,
-                                         "email": OWNER, "turnControl": bool(TURN_CONTROL),
-                                         "search": bool(SEARCH_ON), "searchMin": SEARCH_MIN})
+                # NV2: el correo del dueno solo sale con sesion. Sin sesion no se
+                # devuelve, para que nadie pueda leerlo desde fuera.
+                ok = self._session_ok()
+                datos = {"ok": ok, "brand": BRAND,
+                         "turnControl": bool(TURN_CONTROL),
+                         "search": bool(SEARCH_ON), "searchMin": SEARCH_MIN}
+                if ok:
+                    datos["email"] = OWNER
+                return self._json(200, datos)
             if p == "/api/push/key":
                 if not self._require():
                     return
@@ -1722,20 +1728,19 @@ class Handler(BaseHTTPRequestHandler):
         ip = self._client_ip()
         if not self._rate_ok("ip:" + ip, 6, 3600):
             return self._json(429, {"error": "too many requests"})
-        body = json.loads(self._body().decode("utf-8") or "{}")
-        email = (body.get("email") or "").strip()
-        # F1 (S-2026-11-15, segunda vuelta): el camino de la peticion es identico
-        # para un email que coincide y uno que no, por construccion. Toda la logica
-        # especifica del dueno se mueve a un hilo daemon; no hay comparacion de email,
-        # comprobacion del tope global ni escritura en logins en el camino HTTP. La
-        # respuesta se escribe antes de lanzar el hilo para que ni siquiera el arranque
-        # o la primera ejecucion del trabajo asincrono pueda contaminar la latencia.
+        # F1/NV2 (S-2026-11-15): el cliente ya no manda ningun correo y el servidor
+        # no lo lee: siempre se manda al dueno configurado. Asi no hay comparacion
+        # de email que sondear (ni por respuesta ni por latencia) y no hace falta
+        # que el navegador conozca la direccion. Toda la logica del dueno va en un
+        # hilo daemon y el 200 se escribe antes de lanzarlo.
+        try:
+            self._body()
+        except Exception:
+            pass
         self._json(200, {"ok": True})
-        threading.Thread(target=self._issue_token_if_owner, args=(email,), daemon=True).start()
+        threading.Thread(target=self._issue_token_for_owner, daemon=True).start()
 
-    def _issue_token_if_owner(self, email):
-        if email.lower() != OWNER:
-            return
+    def _issue_token_for_owner(self):
         # F2 (S-2026-11-15): el tope global se comprueba dentro del hilo, antes de
         # generar o insertar el token. Si esta agotado ya no hay canal de respuesta:
         # solo se deja constancia en mail.log y el HTTP ya habia devuelto 200.

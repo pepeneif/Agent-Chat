@@ -1,7 +1,6 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const state = { pending: [], lastAt: 0, timer: null, sending: false, awaitOwn: false, turnControl: false, tmp: [], search: null };
-let OWNER_EMAIL = "";
 // Marca del despliegue: se sustituye con /api/me (CHAT_BRAND) al arrancar.
 let BRAND = "Chat";
 // Fix 3 (zoom al escribir) REVERSIBLE: para volver al comportamiento anterior, cambia a false.
@@ -59,7 +58,7 @@ function showChat() {
 async function requestToken() {
   $("err").textContent = "";
   const b = $("btnToken"); b.disabled = true; b.textContent = "Enviando...";
-  const r = await api("/api/request-token", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: OWNER_EMAIL }) });
+  const r = await api("/api/request-token", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
   b.disabled = false; b.textContent = "Enviarme el codigo por email";
   if (!r.ok) { $("err").textContent = "No se pudo enviar. Intenta de nuevo."; return; }
   $("ok1").classList.remove("hidden");
@@ -1118,7 +1117,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   const jb = $("btnJump"); if (jb) jb.onclick = jumpToEnd;
   const me = await api("/api/me");
   if (me.ok && me.data && me.data.turnControl) state.turnControl = true;
-  if (me.ok && me.data && me.data.email) OWNER_EMAIL = String(me.data.email);
+  // NV2: sin sesion el servidor ya no devuelve el correo del dueno; el cliente
+  // no lo necesita para nada (el servidor decide a quien manda el codigo).
   if (me.ok && me.data && me.data.brand) {
     const b = String(me.data.brand);
     BRAND = b;
